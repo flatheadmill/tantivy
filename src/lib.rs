@@ -196,6 +196,9 @@ pub mod postings;
 pub mod query;
 pub mod schema;
 pub mod space_usage;
+
+/// Spatial indexing module for geometric data types.
+pub mod spatial;
 pub mod store;
 pub mod termdict;
 
