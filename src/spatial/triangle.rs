@@ -121,7 +121,8 @@ impl Triangle {
         let (other_min_x, other_min_y, other_max_x, other_max_y) = other.bounding_box();
 
         // Quick bounding box disjoint test
-        if max_x < other_min_x || min_x > other_max_x || max_y < other_min_y || min_y > other_max_y {
+        if max_x < other_min_x || min_x > other_max_x || max_y < other_min_y || min_y > other_max_y
+        {
             return false;
         }
 
@@ -148,19 +149,39 @@ impl Triangle {
     /// Helper method to check if any edges of this triangle intersect with another triangle
     fn edges_intersect_triangle(&self, other: &Triangle) -> bool {
         // Check if any edge of this triangle intersects any edge of the other triangle
-        self.edge_intersects_edge(self.a_x, self.a_y, self.b_x, self.b_y, other.a_x, other.a_y, other.b_x, other.b_y) ||
-        self.edge_intersects_edge(self.a_x, self.a_y, self.b_x, self.b_y, other.b_x, other.b_y, other.c_x, other.c_y) ||
-        self.edge_intersects_edge(self.a_x, self.a_y, self.b_x, self.b_y, other.c_x, other.c_y, other.a_x, other.a_y) ||
-        self.edge_intersects_edge(self.b_x, self.b_y, self.c_x, self.c_y, other.a_x, other.a_y, other.b_x, other.b_y) ||
-        self.edge_intersects_edge(self.b_x, self.b_y, self.c_x, self.c_y, other.b_x, other.b_y, other.c_x, other.c_y) ||
-        self.edge_intersects_edge(self.b_x, self.b_y, self.c_x, self.c_y, other.c_x, other.c_y, other.a_x, other.a_y) ||
-        self.edge_intersects_edge(self.c_x, self.c_y, self.a_x, self.a_y, other.a_x, other.a_y, other.b_x, other.b_y) ||
-        self.edge_intersects_edge(self.c_x, self.c_y, self.a_x, self.a_y, other.b_x, other.b_y, other.c_x, other.c_y) ||
-        self.edge_intersects_edge(self.c_x, self.c_y, self.a_x, self.a_y, other.c_x, other.c_y, other.a_x, other.a_y)
+        self.edge_intersects_edge(
+            self.a_x, self.a_y, self.b_x, self.b_y, other.a_x, other.a_y, other.b_x, other.b_y,
+        ) || self.edge_intersects_edge(
+            self.a_x, self.a_y, self.b_x, self.b_y, other.b_x, other.b_y, other.c_x, other.c_y,
+        ) || self.edge_intersects_edge(
+            self.a_x, self.a_y, self.b_x, self.b_y, other.c_x, other.c_y, other.a_x, other.a_y,
+        ) || self.edge_intersects_edge(
+            self.b_x, self.b_y, self.c_x, self.c_y, other.a_x, other.a_y, other.b_x, other.b_y,
+        ) || self.edge_intersects_edge(
+            self.b_x, self.b_y, self.c_x, self.c_y, other.b_x, other.b_y, other.c_x, other.c_y,
+        ) || self.edge_intersects_edge(
+            self.b_x, self.b_y, self.c_x, self.c_y, other.c_x, other.c_y, other.a_x, other.a_y,
+        ) || self.edge_intersects_edge(
+            self.c_x, self.c_y, self.a_x, self.a_y, other.a_x, other.a_y, other.b_x, other.b_y,
+        ) || self.edge_intersects_edge(
+            self.c_x, self.c_y, self.a_x, self.a_y, other.b_x, other.b_y, other.c_x, other.c_y,
+        ) || self.edge_intersects_edge(
+            self.c_x, self.c_y, self.a_x, self.a_y, other.c_x, other.c_y, other.a_x, other.a_y,
+        )
     }
 
     /// Test if two line segments intersect using orientation tests
-    fn edge_intersects_edge(&self, ax: i32, ay: i32, bx: i32, by: i32, cx: i32, cy: i32, dx: i32, dy: i32) -> bool {
+    fn edge_intersects_edge(
+        &self,
+        ax: i32,
+        ay: i32,
+        bx: i32,
+        by: i32,
+        cx: i32,
+        cy: i32,
+        dx: i32,
+        dy: i32,
+    ) -> bool {
         let o1 = orient(ax, ay, bx, by, cx, cy);
         let o2 = orient(ax, ay, bx, by, dx, dy);
         let o3 = orient(cx, cy, dx, dy, ax, ay);
@@ -172,23 +193,31 @@ impl Triangle {
         }
 
         // Special cases - points are collinear and lie on the other segment
-        (o1 == 0 && self.point_on_segment(ax, ay, cx, cy, bx, by)) ||
-        (o2 == 0 && self.point_on_segment(ax, ay, dx, dy, bx, by)) ||
-        (o3 == 0 && self.point_on_segment(cx, cy, ax, ay, dx, dy)) ||
-        (o4 == 0 && self.point_on_segment(cx, cy, bx, by, dx, dy))
+        (o1 == 0 && self.point_on_segment(ax, ay, cx, cy, bx, by))
+            || (o2 == 0 && self.point_on_segment(ax, ay, dx, dy, bx, by))
+            || (o3 == 0 && self.point_on_segment(cx, cy, ax, ay, dx, dy))
+            || (o4 == 0 && self.point_on_segment(cx, cy, bx, by, dx, dy))
     }
 
     /// Check if point q lies on line segment pr (when they are collinear)
     fn point_on_segment(&self, px: i32, py: i32, qx: i32, qy: i32, rx: i32, ry: i32) -> bool {
-        qx <= cmp::max(px, rx) && qx >= cmp::min(px, rx) &&
-        qy <= cmp::max(py, ry) && qy >= cmp::min(py, ry)
+        qx <= cmp::max(px, rx)
+            && qx >= cmp::min(px, rx)
+            && qy <= cmp::max(py, ry)
+            && qy >= cmp::min(py, ry)
     }
 
     /// Test if this triangle intersects with a bounding box
     ///
     /// This follows Lucene's approach for spatial indexing where the first
     /// 4 dimensions of encoded triangles represent bounding boxes.
-    pub fn intersects_bbox(&self, bbox_min_x: i32, bbox_min_y: i32, bbox_max_x: i32, bbox_max_y: i32) -> bool {
+    pub fn intersects_bbox(
+        &self,
+        bbox_min_x: i32,
+        bbox_min_y: i32,
+        bbox_max_x: i32,
+        bbox_max_y: i32,
+    ) -> bool {
         let (min_x, min_y, max_x, max_y) = self.bounding_box();
 
         // Quick disjoint test
@@ -197,17 +226,28 @@ impl Triangle {
         }
 
         // Check if any triangle vertex is inside the bbox
-        if (self.a_x >= bbox_min_x && self.a_x <= bbox_max_x && self.a_y >= bbox_min_y && self.a_y <= bbox_max_y) ||
-           (self.b_x >= bbox_min_x && self.b_x <= bbox_max_x && self.b_y >= bbox_min_y && self.b_y <= bbox_max_y) ||
-           (self.c_x >= bbox_min_x && self.c_x <= bbox_max_x && self.c_y >= bbox_min_y && self.c_y <= bbox_max_y) {
+        if (self.a_x >= bbox_min_x
+            && self.a_x <= bbox_max_x
+            && self.a_y >= bbox_min_y
+            && self.a_y <= bbox_max_y)
+            || (self.b_x >= bbox_min_x
+                && self.b_x <= bbox_max_x
+                && self.b_y >= bbox_min_y
+                && self.b_y <= bbox_max_y)
+            || (self.c_x >= bbox_min_x
+                && self.c_x <= bbox_max_x
+                && self.c_y >= bbox_min_y
+                && self.c_y <= bbox_max_y)
+        {
             return true;
         }
 
         // Check if any bbox corner is inside the triangle
-        if self.contains_point(bbox_min_x, bbox_min_y) ||
-           self.contains_point(bbox_max_x, bbox_min_y) ||
-           self.contains_point(bbox_max_x, bbox_max_y) ||
-           self.contains_point(bbox_min_x, bbox_max_y) {
+        if self.contains_point(bbox_min_x, bbox_min_y)
+            || self.contains_point(bbox_max_x, bbox_min_y)
+            || self.contains_point(bbox_max_x, bbox_max_y)
+            || self.contains_point(bbox_min_x, bbox_max_y)
+        {
             return true;
         }
 
@@ -216,20 +256,39 @@ impl Triangle {
     }
 
     /// Helper to check if triangle edges intersect bounding box edges
-    fn edge_intersects_bbox_edge(&self, bbox_min_x: i32, bbox_min_y: i32, bbox_max_x: i32, bbox_max_y: i32) -> bool {
+    fn edge_intersects_bbox_edge(
+        &self,
+        bbox_min_x: i32,
+        bbox_min_y: i32,
+        bbox_max_x: i32,
+        bbox_max_y: i32,
+    ) -> bool {
         // Check each triangle edge against each bbox edge
-        self.edge_intersects_edge(self.a_x, self.a_y, self.b_x, self.b_y, bbox_min_x, bbox_min_y, bbox_max_x, bbox_min_y) ||
-        self.edge_intersects_edge(self.a_x, self.a_y, self.b_x, self.b_y, bbox_max_x, bbox_min_y, bbox_max_x, bbox_max_y) ||
-        self.edge_intersects_edge(self.a_x, self.a_y, self.b_x, self.b_y, bbox_max_x, bbox_max_y, bbox_min_x, bbox_max_y) ||
-        self.edge_intersects_edge(self.a_x, self.a_y, self.b_x, self.b_y, bbox_min_x, bbox_max_y, bbox_min_x, bbox_min_y) ||
-        self.edge_intersects_edge(self.b_x, self.b_y, self.c_x, self.c_y, bbox_min_x, bbox_min_y, bbox_max_x, bbox_min_y) ||
-        self.edge_intersects_edge(self.b_x, self.b_y, self.c_x, self.c_y, bbox_max_x, bbox_min_y, bbox_max_x, bbox_max_y) ||
-        self.edge_intersects_edge(self.b_x, self.b_y, self.c_x, self.c_y, bbox_max_x, bbox_max_y, bbox_min_x, bbox_max_y) ||
-        self.edge_intersects_edge(self.b_x, self.b_y, self.c_x, self.c_y, bbox_min_x, bbox_max_y, bbox_min_x, bbox_min_y) ||
-        self.edge_intersects_edge(self.c_x, self.c_y, self.a_x, self.a_y, bbox_min_x, bbox_min_y, bbox_max_x, bbox_min_y) ||
-        self.edge_intersects_edge(self.c_x, self.c_y, self.a_x, self.a_y, bbox_max_x, bbox_min_y, bbox_max_x, bbox_max_y) ||
-        self.edge_intersects_edge(self.c_x, self.c_y, self.a_x, self.a_y, bbox_max_x, bbox_max_y, bbox_min_x, bbox_max_y) ||
-        self.edge_intersects_edge(self.c_x, self.c_y, self.a_x, self.a_y, bbox_min_x, bbox_max_y, bbox_min_x, bbox_min_y)
+        self.edge_intersects_edge(
+            self.a_x, self.a_y, self.b_x, self.b_y, bbox_min_x, bbox_min_y, bbox_max_x, bbox_min_y,
+        ) || self.edge_intersects_edge(
+            self.a_x, self.a_y, self.b_x, self.b_y, bbox_max_x, bbox_min_y, bbox_max_x, bbox_max_y,
+        ) || self.edge_intersects_edge(
+            self.a_x, self.a_y, self.b_x, self.b_y, bbox_max_x, bbox_max_y, bbox_min_x, bbox_max_y,
+        ) || self.edge_intersects_edge(
+            self.a_x, self.a_y, self.b_x, self.b_y, bbox_min_x, bbox_max_y, bbox_min_x, bbox_min_y,
+        ) || self.edge_intersects_edge(
+            self.b_x, self.b_y, self.c_x, self.c_y, bbox_min_x, bbox_min_y, bbox_max_x, bbox_min_y,
+        ) || self.edge_intersects_edge(
+            self.b_x, self.b_y, self.c_x, self.c_y, bbox_max_x, bbox_min_y, bbox_max_x, bbox_max_y,
+        ) || self.edge_intersects_edge(
+            self.b_x, self.b_y, self.c_x, self.c_y, bbox_max_x, bbox_max_y, bbox_min_x, bbox_max_y,
+        ) || self.edge_intersects_edge(
+            self.b_x, self.b_y, self.c_x, self.c_y, bbox_min_x, bbox_max_y, bbox_min_x, bbox_min_y,
+        ) || self.edge_intersects_edge(
+            self.c_x, self.c_y, self.a_x, self.a_y, bbox_min_x, bbox_min_y, bbox_max_x, bbox_min_y,
+        ) || self.edge_intersects_edge(
+            self.c_x, self.c_y, self.a_x, self.a_y, bbox_max_x, bbox_min_y, bbox_max_x, bbox_max_y,
+        ) || self.edge_intersects_edge(
+            self.c_x, self.c_y, self.a_x, self.a_y, bbox_max_x, bbox_max_y, bbox_min_x, bbox_max_y,
+        ) || self.edge_intersects_edge(
+            self.c_x, self.c_y, self.a_x, self.a_y, bbox_min_x, bbox_max_y, bbox_min_x, bbox_min_y,
+        )
     }
 }
 
@@ -554,10 +613,10 @@ mod tests {
         let triangle = Triangle::new(10, 5, 20, 15, 5, 20, true, false, true);
         let (min_x, min_y, max_x, max_y) = triangle.bounding_box();
 
-        assert_eq!(min_x, 5);   // min of 10, 20, 5
-        assert_eq!(min_y, 5);   // min of 5, 15, 20
-        assert_eq!(max_x, 20);  // max of 10, 20, 5
-        assert_eq!(max_y, 20);  // max of 5, 15, 20
+        assert_eq!(min_x, 5); // min of 10, 20, 5
+        assert_eq!(min_y, 5); // min of 5, 15, 20
+        assert_eq!(max_x, 20); // max of 10, 20, 5
+        assert_eq!(max_y, 20); // max of 5, 15, 20
     }
 
     #[test]
@@ -607,19 +666,46 @@ mod tests {
         assert_eq!(original.bounding_box(), decoded.bounding_box());
 
         // The decoded triangle should contain the same vertices (in any order)
-        let orig_vertices = [(original.a_x, original.a_y), (original.b_x, original.b_y), (original.c_x, original.c_y)];
-        let decoded_vertices = [(decoded.a_x, decoded.a_y), (decoded.b_x, decoded.b_y), (decoded.c_x, decoded.c_y)];
+        let orig_vertices = [
+            (original.a_x, original.a_y),
+            (original.b_x, original.b_y),
+            (original.c_x, original.c_y),
+        ];
+        let decoded_vertices = [
+            (decoded.a_x, decoded.a_y),
+            (decoded.b_x, decoded.b_y),
+            (decoded.c_x, decoded.c_y),
+        ];
 
         for vertex in orig_vertices.iter() {
-            assert!(decoded_vertices.contains(vertex),
-                "Decoded triangle missing vertex {:?}", vertex);
+            assert!(
+                decoded_vertices.contains(vertex),
+                "Decoded triangle missing vertex {:?}",
+                vertex
+            );
         }
 
         // Both triangles should have the same orientation (CCW or collinear)
-        let orig_orient = orient(original.a_x, original.a_y, original.b_x, original.b_y, original.c_x, original.c_y);
-        let decoded_orient = orient(decoded.a_x, decoded.a_y, decoded.b_x, decoded.b_y, decoded.c_x, decoded.c_y);
-        assert!(orig_orient >= 0 && decoded_orient >= 0,
-            "Both triangles should have CCW or collinear orientation");
+        let orig_orient = orient(
+            original.a_x,
+            original.a_y,
+            original.b_x,
+            original.b_y,
+            original.c_x,
+            original.c_y,
+        );
+        let decoded_orient = orient(
+            decoded.a_x,
+            decoded.a_y,
+            decoded.b_x,
+            decoded.b_y,
+            decoded.c_x,
+            decoded.c_y,
+        );
+        assert!(
+            orig_orient >= 0 && decoded_orient >= 0,
+            "Both triangles should have CCW or collinear orientation"
+        );
     }
 
     #[test]
@@ -633,7 +719,8 @@ mod tests {
         let max_y = sortable_bytes_to_int(&encoded, 2 * BYTES);
         let max_x = sortable_bytes_to_int(&encoded, 3 * BYTES);
 
-        let (expected_min_x, expected_min_y, expected_max_x, expected_max_y) = triangle.bounding_box();
+        let (expected_min_x, expected_min_y, expected_max_x, expected_max_y) =
+            triangle.bounding_box();
 
         assert_eq!(min_x, expected_min_x);
         assert_eq!(min_y, expected_min_y);
@@ -659,8 +746,8 @@ mod tests {
     #[test]
     fn test_orientation_consistency() {
         // Test that our orient function matches Lucene's behavior
-        assert_eq!(orient(0, 0, 1, 0, 0, 1), 1);  // CCW
+        assert_eq!(orient(0, 0, 1, 0, 0, 1), 1); // CCW
         assert_eq!(orient(0, 0, 0, 1, 1, 0), -1); // CW
-        assert_eq!(orient(0, 0, 1, 1, 2, 2), 0);  // Collinear
+        assert_eq!(orient(0, 0, 1, 1, 2, 2), 0); // Collinear
     }
 }
