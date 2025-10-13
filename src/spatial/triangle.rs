@@ -3,6 +3,9 @@
 //! Encodes triangles as 7-dimensional points for BKD tree storage, using a deterministic canonical
 //! form that preserves boundary edge information while enabling efficient bounding box queries.
 
+use geo_types::MultiPolygon;
+use i_triangle::i_overlay::i_float::int::point::IntPoint;
+use i_triangle::int::triangulatable::IntTriangulatable;
 use robust::{orient2d, Coord};
 
 const MINY_MINX_MAXY_MAXX_Y_X: i32 = 0;
@@ -13,6 +16,59 @@ const Y_MINX_MINY_X_MAXY_MAXX: i32 = 4;
 const Y_MINX_MINY_MAXX_MAXY_X: i32 = 5;
 const MAXY_MINX_MINY_X_Y_MAXX: i32 = 6;
 const MINY_MINX_Y_MAXX_MAXY_X: i32 = 7;
+
+/// Triangulates a geographic polygon into canonical triangle representations.
+///
+/// Takes a polygon with floating-point lat/lon coordinates, converts to integer coordinates with
+/// millimeter precision (using 2^32 scaling), performs constrained Delaunay triangulation, and
+/// encodes the resulting triangles with boundary edge information for BKD tree spatial indexing.
+///
+/// Handles polygons with holes correctly, preserving which triangle edges lie on the original
+/// polygon boundaries versus internal tessellation edges.
+pub fn triangulate<G>(geometry: G) -> Vec<Triangle>
+where G: Into<MultiPolygon<f64>> {
+    let multi = geometry.into();
+    let mut triangles = Vec::new();
+    for polygon in multi {
+        let exterior: Vec<IntPoint> = polygon
+            .exterior()
+            .coords()
+            .map(|coord| {
+                let lat = (coord.y / (180.0 / (1i64 << 32) as f64)).floor() as i32;
+                let lon = (coord.x / (360.0 / (1i64 << 32) as f64)).floor() as i32;
+                IntPoint::new(lon, lat)
+            })
+            .collect();
+        let mut i_polygon = vec![exterior];
+        for interior in polygon.interiors() {
+            let hole: Vec<IntPoint> = interior
+                .coords()
+                .map(|coord| {
+                    let lat = (coord.y / (180.0 / (1i64 << 32) as f64)).floor() as i32;
+                    let lon = (coord.x / (360.0 / (1i64 << 32) as f64)).floor() as i32;
+                    IntPoint::new(lon, lat)
+                })
+                .collect();
+            i_polygon.push(hole);
+        }
+        let delaunay = i_polygon.triangulate().into_delaunay();
+        for (_, triangle) in delaunay.triangles.iter().enumerate() {
+            let bounds = [
+                triangle.neighbors[0] == usize::MAX,
+                triangle.neighbors[1] == usize::MAX,
+                triangle.neighbors[2] == usize::MAX,
+            ];
+            let v0 = &delaunay.points[triangle.vertices[0].index];
+            let v1 = &delaunay.points[triangle.vertices[1].index];
+            let v2 = &delaunay.points[triangle.vertices[2].index];
+            triangles.push(Triangle::encode(
+                [v0.x, v0.y, v1.x, v1.y, v2.x, v2.y],
+                bounds,
+            ))
+        }
+    }
+    triangles
+}
 
 /// A triangle encoded in canonical form for spatial indexing.
 ///
@@ -228,6 +284,8 @@ impl Triangle {
 
 #[cfg(test)]
 mod tests {
+    use geo_types::polygon;
+
     use super::*;
 
     #[test]
@@ -300,5 +358,14 @@ mod tests {
             let (decoded_coords, _) = triangle.decode();
             assert_eq!(decoded_coords, coords);
         }
+    }
+
+    #[test]
+    fn triangulate_box() {
+        let polygon = polygon![
+            (x: 0.0, y: 0.0), (x: 10.0, y: 0.0), (x: 10.0, y: 10.0), (x: 0.0, y: 10.0)
+        ];
+        let triangles = triangulate(polygon);
+        assert_eq!(triangles.len(), 2);
     }
 }
