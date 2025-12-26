@@ -5,9 +5,9 @@ use common::BitSet;
 use crate::query::explanation::does_not_match;
 use crate::query::{BitSetDocSet, Explanation, Query, Scorer, Weight};
 use crate::schema::Field;
-use crate::spatial::bkd::{search_contains, search_intersects, search_within, Segment};
+use crate::spatial::bvh::{search_contains, search_intersects, search_within, Segment};
+use crate::spatial::envelope::{Spatial, SpatialI32, Point};
 use crate::spatial::point::GeoPoint;
-use crate::spatial::writer::as_point_i32;
 use crate::{DocId, DocSet, Score, TERMINATED};
 
 #[derive(Clone, Copy, Debug)]
@@ -25,7 +25,7 @@ pub enum SpatialQueryType {
 /// HUSH
 pub struct SpatialQuery {
     field: Field,
-    bounds: [(i32, i32); 2],
+    bounds: [GeoPoint; 2],
     query_type: SpatialQueryType,
 }
 
@@ -34,7 +34,7 @@ impl SpatialQuery {
     pub fn new(field: Field, bounds: [GeoPoint; 2], query_type: SpatialQueryType) -> Self {
         SpatialQuery {
             field,
-            bounds: [as_point_i32(bounds[0]), as_point_i32(bounds[1])],
+            bounds: [bounds[0], bounds[1]],
             query_type,
         }
     }
@@ -55,12 +55,12 @@ impl Query for SpatialQuery {
 
 pub struct SpatialWeight {
     field: Field,
-    bounds: [(i32, i32); 2],
+    bounds: [GeoPoint; 2],
     query_type: SpatialQueryType,
 }
 
 impl SpatialWeight {
-    fn new(field: Field, bounds: [(i32, i32); 2], query_type: SpatialQueryType) -> Self {
+    fn new(field: Field, bounds: [GeoPoint; 2], query_type: SpatialQueryType) -> Self {
         SpatialWeight {
             field,
             bounds,
@@ -82,54 +82,45 @@ impl Weight for SpatialWeight {
                 return Ok(Box::new(SpatialScorer::new(boost, empty_bitset, None)));
             }
         };
-        let block_kd_tree = Segment::new(spatial_reader.get_bytes());
+        let bvh_tree = Segment::<SpatialI32>::new(spatial_reader.get_bytes());
         match self.query_type {
             SpatialQueryType::Intersects => {
                 let mut include = BitSet::with_max_value(reader.max_doc());
+                let tr = <SpatialI32 as Spatial>::Point::from_geo(self.bounds[0]);
+                let bl = <SpatialI32 as Spatial>::Point::from_geo(self.bounds[1]);
                 search_intersects(
-                    &block_kd_tree,
-                    block_kd_tree.root_offset,
-                    &[
-                        self.bounds[0].1,
-                        self.bounds[0].0,
-                        self.bounds[1].1,
-                        self.bounds[1].0,
-                    ],
+                    &bvh_tree,
+                    bvh_tree.root_offset,
+                    &[ bl.y(), bl.x(), tr.y(), tr.x() ],
                     &mut include,
                 )?;
                 Ok(Box::new(SpatialScorer::new(boost, include, None)))
             }
             SpatialQueryType::Within => {
                 let mut include = BitSet::with_max_value(reader.max_doc());
-                let mut exclude = BitSet::with_max_value(reader.max_doc());
+                // TODO dead code.
+                let exclude = BitSet::with_max_value(reader.max_doc());
+                let tr = <SpatialI32 as Spatial>::Point::from_geo(self.bounds[0]);
+                let bl = <SpatialI32 as Spatial>::Point::from_geo(self.bounds[1]);
                 search_within(
-                    &block_kd_tree,
-                    block_kd_tree.root_offset,
-                    &[
-                        self.bounds[0].1,
-                        self.bounds[0].0,
-                        self.bounds[1].1,
-                        self.bounds[1].0,
-                    ],
+                    &bvh_tree,
+                    bvh_tree.root_offset,
+                    &[ bl.y(), bl.x(), tr.y(), tr.x() ],
                     &mut include,
-                    &mut exclude,
                 )?;
                 Ok(Box::new(SpatialScorer::new(boost, include, Some(exclude))))
             }
             SpatialQueryType::Contains => {
                 let mut include = BitSet::with_max_value(reader.max_doc());
-                let mut exclude = BitSet::with_max_value(reader.max_doc());
+                // TODO dead code.
+                let exclude = BitSet::with_max_value(reader.max_doc());
+                let tr = <SpatialI32 as Spatial>::Point::from_geo(self.bounds[0]);
+                let bl = <SpatialI32 as Spatial>::Point::from_geo(self.bounds[1]);
                 search_contains(
-                    &block_kd_tree,
-                    block_kd_tree.root_offset,
-                    &[
-                        self.bounds[0].1,
-                        self.bounds[0].0,
-                        self.bounds[1].1,
-                        self.bounds[1].0,
-                    ],
+                    &bvh_tree,
+                    bvh_tree.root_offset,
+                    &[ bl.y(), bl.x(), tr.y(), tr.x() ],
                     &mut include,
-                    &mut exclude,
                 )?;
                 Ok(Box::new(SpatialScorer::new(boost, include, Some(exclude))))
             }
@@ -153,7 +144,7 @@ impl Weight for SpatialWeight {
         let mut explanation = Explanation::new(query_type_desc, score);
         explanation.add_context(format!(
             "bounds: [({}, {}), ({}, {})]",
-            self.bounds[0].0, self.bounds[0].1, self.bounds[1].0, self.bounds[1].1,
+            self.bounds[0].lon, self.bounds[0].lat, self.bounds[1].lon, self.bounds[1].lat,
         ));
         explanation.add_context(format!("field: {:?}", self.field));
         Ok(explanation)

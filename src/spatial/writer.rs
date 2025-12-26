@@ -2,124 +2,104 @@
 use std::collections::HashMap;
 use std::io;
 
-use i_triangle::i_overlay::i_float::int::point::IntPoint;
-use i_triangle::int::triangulatable::IntTriangulatable;
-
 use crate::schema::Field;
+use crate::spatial::envelope::{Bounds, Envelope, Point, Spatial};
 use crate::spatial::geometry::Geometry;
 use crate::spatial::point::GeoPoint;
 use crate::spatial::serializer::SpatialSerializer;
-use crate::spatial::triangle::{delaunay_to_triangles, Triangle};
 use crate::DocId;
 
 /// HUSH
-pub struct SpatialWriter {
-    /// Map from field to its triangles buffer
-    triangles_by_field: HashMap<Field, Vec<Triangle>>,
+pub struct SpatialWriter<S: Spatial> {
+    /// Map from field to its boudning envelope.
+    envelopes_by_field: HashMap<Field, HashMap<DocId, S::Bounds>>,
 }
 
-impl SpatialWriter {
+impl<S: Spatial> SpatialWriter<S> {
     /// HUST
     pub fn add_geometry(&mut self, doc_id: DocId, field: Field, geometry: Geometry) {
-        let triangles = &mut self.triangles_by_field.entry(field).or_default();
+        let envelopes = self.envelopes_by_field.entry(field).or_default();
+        let bounds = envelopes.entry(doc_id).or_insert_with(S::Bounds::empty);
+        Self::extend_by_geometry(bounds, geometry);
+    }
+
+    fn extend_by_geometry(bounds: &mut S::Bounds, geometry: Geometry) {
         match geometry {
             Geometry::Point(point) => {
-                append_point(triangles, doc_id, point);
+                bounds.extend_by_point(S::Point::from_geo(point));
             }
-            Geometry::MultiPoint(multi_point) => {
-                for point in multi_point {
-                    append_point(triangles, doc_id, point);
+            Geometry::MultiPoint(points) => {
+                for point in points {
+                    bounds.extend_by_point(S::Point::from_geo(point));
                 }
             }
-            Geometry::LineString(line_string) => {
-                append_line_string(triangles, doc_id, line_string);
+            Geometry::LineString(line) => {
+                Self::extend_by_line_string(bounds, &line);
             }
-            Geometry::MultiLineString(multi_line_string) => {
-                for line_string in multi_line_string {
-                    append_line_string(triangles, doc_id, line_string);
+            Geometry::MultiLineString(lines) => {
+                for line in lines {
+                    Self::extend_by_line_string(bounds, &line);
                 }
             }
             Geometry::Polygon(polygon) => {
-                append_polygon(triangles, doc_id, &polygon);
+                for ring in polygon {
+                    Self::extend_by_line_string(bounds, &ring);
+                }
             }
-            Geometry::MultiPolygon(multi_polygon) => {
-                for polygon in multi_polygon {
-                    append_polygon(triangles, doc_id, &polygon);
+            Geometry::MultiPolygon(polygons) => {
+                for polygon in polygons {
+                    for ring in polygon {
+                        Self::extend_by_line_string(bounds, &ring);
+                    }
                 }
             }
             Geometry::GeometryCollection(geometries) => {
                 for geometry in geometries {
-                    self.add_geometry(doc_id, field, geometry);
+                    Self::extend_by_geometry(bounds, geometry);
                 }
             }
         }
     }
 
+    fn extend_by_line_string(bounds: &mut S::Bounds, line: &[GeoPoint]) {
+        let mut iter = line.iter();
+        let Some(first) = iter.next() else { return };
+        let mut prev = S::Point::from_geo(*first);
+        bounds.extend_by_point(prev);
+        for geo in iter {
+            let point = S::Point::from_geo(*geo);
+            bounds.extend_by_line(prev, point);
+            prev = point;
+        }
+    }
+
     /// Memory usage estimate
     pub fn mem_usage(&self) -> usize {
-        self.triangles_by_field
+        self.envelopes_by_field
             .values()
-            .map(|triangles| triangles.len() * std::mem::size_of::<Triangle>())
+            .map(|envelopes| envelopes.len() * std::mem::size_of::<Envelope<S::Bounds>>())
             .sum()
     }
 
     /// Serializing our field.
-    pub fn serialize(&mut self, mut serializer: SpatialSerializer) -> io::Result<()> {
-        for (field, triangles) in &mut self.triangles_by_field {
-            serializer.serialize_field(*field, triangles)?;
+    pub fn serialize(&mut self, mut serializer: SpatialSerializer<S>) -> io::Result<()> {
+        for (field, envelope_map) in &mut self.envelopes_by_field {
+            let mut envelopes: Vec<Envelope<S::Bounds>> = envelope_map
+                .iter()
+                .map(|(&doc_id, &bounds)| Envelope::from_bounds(doc_id, bounds))
+                .collect();
+            serializer.serialize_field(*field, &mut envelopes)?;
         }
         serializer.close()?;
         Ok(())
     }
 }
 
-impl Default for SpatialWriter {
+impl<S: Spatial> Default for SpatialWriter<S> {
     /// HUSH
     fn default() -> Self {
         SpatialWriter {
-            triangles_by_field: HashMap::new(),
+            envelopes_by_field: HashMap::new(),
         }
     }
-}
-
-/// Convert a point of `(longitude, latitude)` to a integer point.
-pub fn as_point_i32(point: GeoPoint) -> (i32, i32) {
-    (
-        (point.lon / (360.0 / (1i64 << 32) as f64)).floor() as i32,
-        (point.lat / (180.0 / (1i64 << 32) as f64)).floor() as i32,
-    )
-}
-
-fn append_point(triangles: &mut Vec<Triangle>, doc_id: DocId, point: GeoPoint) {
-    let point = as_point_i32(point);
-    triangles.push(Triangle::from_point(doc_id, point.0, point.1));
-}
-
-fn append_line_string(triangles: &mut Vec<Triangle>, doc_id: DocId, line_string: Vec<GeoPoint>) {
-    let mut previous = as_point_i32(line_string[0]);
-    for point in line_string.into_iter().skip(1) {
-        let point = as_point_i32(point);
-        triangles.push(Triangle::from_line_segment(
-            doc_id, previous.0, previous.1, point.0, point.1,
-        ));
-        previous = point
-    }
-}
-
-fn append_ring(i_polygon: &mut Vec<Vec<IntPoint>>, ring: &[GeoPoint]) {
-    let mut i_ring = Vec::with_capacity(ring.len() + 1);
-    for &point in ring {
-        let point = as_point_i32(point);
-        i_ring.push(IntPoint::new(point.0, point.1));
-    }
-    i_polygon.push(i_ring);
-}
-
-fn append_polygon(triangles: &mut Vec<Triangle>, doc_id: DocId, polygon: &[Vec<GeoPoint>]) {
-    let mut i_polygon: Vec<Vec<IntPoint>> = Vec::new();
-    for ring in polygon {
-        append_ring(&mut i_polygon, ring);
-    }
-    let delaunay = i_polygon.triangulate().into_delaunay();
-    delaunay_to_triangles(doc_id, &delaunay, triangles);
 }

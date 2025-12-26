@@ -1,33 +1,42 @@
 //! HUSH
 use std::io;
 use std::io::Write;
+use std::marker::PhantomData;
 
 use crate::directory::{CompositeWrite, WritePtr};
 use crate::schema::Field;
-use crate::spatial::bkd::write_block_kd_tree;
-use crate::spatial::triangle::Triangle;
+use crate::spatial::bvh::write_tree;
+use crate::spatial::envelope::{Envelope, Spatial};
 
 /// The fieldnorms serializer is in charge of
 /// the serialization of field norms for all fields.
-pub struct SpatialSerializer {
+pub struct SpatialSerializer<S: Spatial> {
     composite_write: CompositeWrite,
+    _marker: PhantomData<S>,
 }
 
-impl SpatialSerializer {
+impl<S: Spatial> SpatialSerializer<S> {
     /// Create a composite file from the write pointer.
-    pub fn from_write(write: WritePtr) -> io::Result<SpatialSerializer> {
+    pub fn from_write(write: WritePtr) -> io::Result<SpatialSerializer<S>> {
         // just making room for the pointer to header.
         let composite_write = CompositeWrite::wrap(write);
-        Ok(SpatialSerializer { composite_write })
+        Ok(SpatialSerializer::<S> {
+            composite_write,
+            _marker: PhantomData,
+        })
     }
 
     /// Serialize the given field
-    pub fn serialize_field(&mut self, field: Field, triangles: &mut [Triangle]) -> io::Result<()> {
-        if triangles.is_empty() {
+    pub fn serialize_field(
+        &mut self,
+        field: Field,
+        envelopes: &mut [Envelope<S::Bounds>],
+    ) -> io::Result<()> {
+        if envelopes.is_empty() {
             return Ok(());
         }
         let write = self.composite_write.for_field(field);
-        write_block_kd_tree(triangles, write)?;
+        write_tree::<S>(envelopes, write)?;
         write.flush()?;
         Ok(())
     }

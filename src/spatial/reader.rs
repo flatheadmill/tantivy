@@ -9,12 +9,14 @@ use crate::directory::CompositeFile;
 use crate::schema::Field;
 use crate::space_usage::PerFieldSpaceUsage;
 
+/// HUSH
 #[derive(Clone)]
 pub struct SpatialReaders {
     data: Arc<CompositeFile>,
 }
 
 impl SpatialReaders {
+    /// HUSH
     pub fn empty() -> SpatialReaders {
         SpatialReaders {
             data: Arc::new(CompositeFile::empty()),

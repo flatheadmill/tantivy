@@ -15,6 +15,7 @@ use crate::postings::{
 };
 use crate::schema::document::{Document, Value};
 use crate::schema::{FieldEntry, FieldType, Schema, Term, DATE_TIME_PRECISION_INDEXED};
+use crate::spatial::envelope::SpatialI32;
 use crate::spatial::writer::SpatialWriter;
 use crate::tokenizer::{FacetTokenizer, PreTokenizedStream, TextAnalyzer, Tokenizer};
 use crate::{DocId, Opstamp, TantivyError};
@@ -52,7 +53,7 @@ pub struct SegmentWriter {
     pub(crate) segment_serializer: SegmentSerializer,
     pub(crate) fast_field_writers: FastFieldsWriter,
     pub(crate) fieldnorms_writer: FieldNormsWriter,
-    pub(crate) spatial_writer: SpatialWriter,
+    pub(crate) spatial_writer: SpatialWriter<SpatialI32>,
     pub(crate) json_path_writer: JsonPathWriter,
     pub(crate) json_positions_per_path: IndexingPositionsPerPath,
     pub(crate) doc_opstamps: Vec<Opstamp>,
@@ -403,7 +404,7 @@ fn remap_and_write(
     ctx: IndexingContext,
     fast_field_writers: FastFieldsWriter,
     fieldnorms_writer: &FieldNormsWriter,
-    spatial_writer: &mut SpatialWriter,
+    spatial_writer: &mut SpatialWriter<SpatialI32>,
     mut serializer: SegmentSerializer,
 ) -> crate::Result<()> {
     debug!("remap-and-write");
