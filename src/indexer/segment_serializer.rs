@@ -4,7 +4,7 @@ use crate::directory::WritePtr;
 use crate::fieldnorm::FieldNormsSerializer;
 use crate::index::{Segment, SegmentComponent};
 use crate::postings::InvertedIndexSerializer;
-use crate::spatial::envelope::SpatialI32;
+use crate::spatial::envelope::SpatialF64;
 use crate::spatial::serializer::SpatialSerializer;
 use crate::store::StoreWriter;
 
@@ -14,7 +14,7 @@ pub struct SegmentSerializer {
     segment: Segment,
     pub(crate) store_writer: StoreWriter,
     fast_field_write: WritePtr,
-    spatial_serializer: Option<SpatialSerializer<SpatialI32>>,
+    spatial_serializer: Option<SpatialSerializer<SpatialF64>>,
     fieldnorms_serializer: Option<FieldNormsSerializer>,
     postings_serializer: InvertedIndexSerializer,
 }
@@ -38,7 +38,7 @@ impl SegmentSerializer {
         let fieldnorms_write = segment.open_write(SegmentComponent::FieldNorms)?;
         let fieldnorms_serializer = FieldNormsSerializer::from_write(fieldnorms_write)?;
 
-        let spatial_serializer: Option<SpatialSerializer<SpatialI32>> =
+        let spatial_serializer: Option<SpatialSerializer<SpatialF64>> =
             if segment.schema().contains_spatial_field() {
                 let spatial_write = segment.open_write(SegmentComponent::Spatial)?;
                 Some(SpatialSerializer::from_write(spatial_write)?)
@@ -77,7 +77,7 @@ impl SegmentSerializer {
     }
 
     /// Accessor to the `SpatialSerializer`
-    pub fn extract_spatial_serializer(&mut self) -> Option<SpatialSerializer<SpatialI32>> {
+    pub fn extract_spatial_serializer(&mut self) -> Option<SpatialSerializer<SpatialF64>> {
         self.spatial_serializer.take()
     }
 

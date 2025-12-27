@@ -16,67 +16,71 @@ use std::marker::PhantomData;
 use common::{BitSet, CountingWriter};
 
 use crate::directory::WritePtr;
-use crate::spatial::envelope::{Bounds, Coordinate, Envelope, LeafCompression, Spatial};
+use crate::spatial::envelope::{Bounds, Envelope, LeafCompression, Spatial};
 
-pub(crate) struct SpreadSurvey<C: Coordinate> {
-    min: C,
-    max: C,
+pub(crate) struct SpreadSurvey {
+    min: f64,
+    max: f64,
 }
 
-impl<C: Coordinate> SpreadSurvey<C> {
-    pub(crate) fn survey(&mut self, value: C) {
-        self.min = self.min.minimum(value);
-        self.max = self.max.maximum(value);
+impl SpreadSurvey {
+    pub(crate) fn survey(&mut self, value: f64) {
+        self.min = self.min.min(value);
+        self.max = self.max.max(value);
     }
-    pub(crate) fn spread(&self) -> C {
-        self.max.subtract(self.min)
+    pub(crate) fn spread(&self) -> f64 {
+        self.max - self.min
     }
 }
 
-impl<C: Coordinate> Default for SpreadSurvey<C> {
+impl Default for SpreadSurvey {
     fn default() -> Self {
         SpreadSurvey {
-            min: C::MAX,
-            max: C::MIN,
+            min: f64::MAX,
+            max: f64::MIN,
         }
     }
 }
 
-struct EnvelopeSurvey<S: Spatial> {
-    bounds: Vec<S::Coord>,
+struct EnvelopeSurvey<S> {
+    bounds: Vec<f64>,
+    _marker: PhantomData<S>,
 }
 
 impl<S: Spatial> EnvelopeSurvey<S> {
     fn survey(&mut self, envelope: &Envelope<S::Bounds>) {
         let dims = S::DIMENSIONS;
         for i in 0..dims {
-            self.bounds[i] = self.bounds[i].minimum(envelope.bounds.get(i));
-            self.bounds[i + dims] = self.bounds[i + dims].maximum(envelope.bounds.get(i + dims));
+            self.bounds[i] = self.bounds[i].min(envelope.bounds.get(i));
+            self.bounds[i + dims] = self.bounds[i + dims].max(envelope.bounds.get(i + dims));
         }
     }
-    fn bounds(&self) -> Vec<S::Coord> {
+    fn bounds(&self) -> Vec<f64> {
         self.bounds.clone()
     }
 }
 
 impl<S: Spatial> Default for EnvelopeSurvey<S> {
     fn default() -> Self {
-        let mut bounds = vec![<S::Coord>::MAX; S::COORDINATES];
+        let mut bounds = vec![f64::MAX; S::COORDINATES];
         for i in S::DIMENSIONS..S::COORDINATES {
-            bounds[i] = <S::Coord>::MIN;
+            bounds[i] = f64::MIN;
         }
-        EnvelopeSurvey { bounds }
+        EnvelopeSurvey {
+            bounds,
+            _marker: PhantomData,
+        }
     }
 }
 
-enum BuildNode<S: Spatial> {
+enum BuildNode {
     Branch {
-        bounds: Vec<S::Coord>,
-        left: Box<BuildNode<S>>,
-        right: Box<BuildNode<S>>,
+        bounds: Vec<f64>,
+        left: Box<BuildNode>,
+        right: Box<BuildNode>,
     },
     Leaf {
-        bounds: Vec<S::Coord>,
+        bounds: Vec<f64>,
         pos: u64,
         len: u16,
     },
@@ -95,7 +99,7 @@ enum BuildNode<S: Spatial> {
 fn write_leaf_pages<S: Spatial>(
     envelopes: &mut [Envelope<S::Bounds>],
     write: &mut CountingWriter<WritePtr>,
-) -> io::Result<BuildNode<S>> {
+) -> io::Result<BuildNode> {
     // If less than 512 triangles we are at a leaf, otherwise we still in the inner nodes.
     if envelopes.len() <= S::Compression::PAGE_SIZE {
         let mut survey = EnvelopeSurvey::<S>::default();
@@ -111,7 +115,7 @@ fn write_leaf_pages<S: Spatial>(
             len: len as u16,
         })
     } else {
-        let mut spreads: Vec<SpreadSurvey<S::Coord>> = (0..S::COORDINATES)
+        let mut spreads: Vec<SpreadSurvey> = (0..S::COORDINATES)
             .map(|_| SpreadSurvey::default())
             .collect();
         let mut survey = EnvelopeSurvey::<S>::default();
@@ -124,13 +128,13 @@ fn write_leaf_pages<S: Spatial>(
         let (dimension, _) = spreads
             .iter()
             .enumerate()
-            .max_by(|(_, a), (_, b)| a.spread().compare(&b.spread()))
+            .max_by(|(_, a), (_, b)| a.spread().total_cmp(&b.spread()))
             .unwrap();
 
         // Partition the envelopes.
         let mid = envelopes.len() / 2;
         envelopes.select_nth_unstable_by(mid, |a, b| {
-            a.bounds.get(dimension).compare(&b.bounds.get(dimension))
+            a.bounds.get(dimension).total_cmp(&b.bounds.get(dimension))
         });
         let partition = envelopes[mid].bounds.get(dimension);
         let mut split_point = mid + 1;
@@ -179,7 +183,7 @@ fn write_leaf_pages<S: Spatial>(
 }
 
 fn write_leaf_nodes<S: Spatial>(
-    node: &BuildNode<S>,
+    node: &BuildNode,
     write: &mut CountingWriter<WritePtr>,
 ) -> io::Result<()> {
     match node {
@@ -188,8 +192,8 @@ fn write_leaf_nodes<S: Spatial>(
             left,
             right,
         } => {
-            write_leaf_nodes(right, write)?;
-            write_leaf_nodes(left, write)?;
+            write_leaf_nodes::<S>(right, write)?;
+            write_leaf_nodes::<S>(left, write)?;
         }
         BuildNode::Leaf { bounds, pos, len } => {
             for &dimension in bounds.iter() {
@@ -203,15 +207,15 @@ fn write_leaf_nodes<S: Spatial>(
 }
 
 fn leaf_node_size<S: Spatial>() -> usize {
-    S::COORDINATES * <S::Coord>::BYTE_SIZE + 10 // bounds + pos(8) + len(2)
+    S::COORDINATES * 8 + 10 // bounds + pos(8) + len(2)
 }
 
 fn branch_node_size<S: Spatial>() -> usize {
-    S::COORDINATES * <S::Coord>::BYTE_SIZE + 8 // bounds + left(4) + right(4)
+    S::COORDINATES * 8 + 8 // bounds + left(4) + right(4)
 }
 
 fn write_branch_nodes<S: Spatial>(
-    node: &BuildNode<S>,
+    node: &BuildNode,
     branch_offset: &mut i32,
     leaf_offset: &mut i32,
     write: &mut CountingWriter<WritePtr>,
@@ -227,8 +231,8 @@ fn write_branch_nodes<S: Spatial>(
             left,
             right,
         } => {
-            let left = write_branch_nodes(left, branch_offset, leaf_offset, write)?;
-            let right = write_branch_nodes(right, branch_offset, leaf_offset, write)?;
+            let left = write_branch_nodes::<S>(left, branch_offset, leaf_offset, write)?;
+            let right = write_branch_nodes::<S>(right, branch_offset, leaf_offset, write)?;
             for &val in bounds {
                 write.write_all(val.to_le_bytes().as_ref())?;
             }
@@ -264,11 +268,11 @@ pub fn write_tree<S: Spatial>(
     write.write_all(&VERSION.to_le_bytes())?;
 
     let tree = write_leaf_pages::<S>(envelopes, write)?;
-    write_leaf_nodes(&tree, write)?;
+    write_leaf_nodes::<S>(&tree, write)?;
     let branch_position = write.written_bytes();
     let mut branch_offset: i32 = 0;
     let mut leaf_offset: i32 = -1;
-    let root = write_branch_nodes(&tree, &mut branch_offset, &mut leaf_offset, write)?;
+    let root = write_branch_nodes::<S>(&tree, &mut branch_offset, &mut leaf_offset, write)?;
     write.write_all(&envelopes.len().to_le_bytes())?;
     write.write_all(&root.to_le_bytes())?;
     write.write_all(&branch_position.to_le_bytes())?;
@@ -315,20 +319,22 @@ impl<'a, S: Spatial> Segment<'a, S> {
         }
     }
     #[inline(always)]
-    fn bounds(&self, offset: i32) -> Vec<S::Coord> {
-        let sizeof_bounds = S::COORDINATES * <S::Coord>::BYTE_SIZE;
+    fn bounds(&self, offset: i32) -> Vec<f64> {
+        let sizeof_bounds = S::COORDINATES * 8;
         let byte_offset = (self.branch_position as i64 + offset as i64) as usize;
         let bytes = &self.data[byte_offset..byte_offset + sizeof_bounds];
         let mut bounds = Vec::with_capacity(S::COORDINATES);
         for i in 0..S::COORDINATES {
-            let start = i * <S::Coord>::BYTE_SIZE;
-            bounds.push(<S::Coord>::from_le_bytes(&bytes[start..]));
+            let start = i * 8;
+            bounds.push(f64::from_le_bytes(
+                bytes[start..start + 8].try_into().unwrap(),
+            ));
         }
         bounds
     }
     #[inline(always)]
     fn branch_node(&self, offset: i32) -> BranchNode {
-        let sizeof_bounds = S::COORDINATES * <S::Coord>::BYTE_SIZE;
+        let sizeof_bounds = S::COORDINATES * 8;
         let byte_offset = (self.branch_position as i64 + offset as i64) as usize;
         let child_offset = byte_offset + sizeof_bounds;
         let bytes = &self.data[child_offset..child_offset + 8];
@@ -339,13 +345,13 @@ impl<'a, S: Spatial> Segment<'a, S> {
     }
     #[inline(always)]
     fn leaf_node(&self, offset: i32) -> LeafNode {
-        let sizeof_bounds = S::COORDINATES * <S::Coord>::BYTE_SIZE;
+        let sizeof_bounds = S::COORDINATES * 8;
         let byte_offset = (self.branch_position as i64 + offset as i64) as usize;
         let data_offset = byte_offset + sizeof_bounds;
         let bytes = &self.data[data_offset..data_offset + 10];
         LeafNode {
             pos: u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
-            len: u16::from_le_bytes(bytes[8..10] .try_into() .unwrap()),
+            len: u16::from_le_bytes(bytes[8..10].try_into().unwrap()),
         }
     }
     fn leaf_page(&self, leaf_node: &LeafNode) -> &[u8] {
@@ -353,7 +359,7 @@ impl<'a, S: Spatial> Segment<'a, S> {
     }
 }
 
-fn bounds_within<S: Spatial>(bounds: &[S::Coord], query: &[S::Coord]) -> bool {
+fn bounds_within<S: Spatial>(bounds: &[f64], query: &[f64]) -> bool {
     for i in 0..S::DIMENSIONS {
         if bounds[i] < query[i] {
             return false;
@@ -365,7 +371,7 @@ fn bounds_within<S: Spatial>(bounds: &[S::Coord], query: &[S::Coord]) -> bool {
     true
 }
 
-fn bounds_intersects<S: Spatial>(bounds: &[S::Coord], query: &[S::Coord]) -> bool {
+fn bounds_intersects<S: Spatial>(bounds: &[f64], query: &[f64]) -> bool {
     for i in 0..S::DIMENSIONS {
         if bounds[i + S::DIMENSIONS] < query[i] || bounds[i] > query[i + S::DIMENSIONS] {
             return false; // disjoint in this dimension
@@ -406,7 +412,7 @@ fn collect_all_docs<S: Spatial>(
 pub fn search_intersects<S: Spatial>(
     segment: &Segment<S>,
     offset: i32,
-    query: &[S::Coord],
+    query: &[f64],
     docs: &mut BitSet,
 ) -> io::Result<()> {
     let bounds = segment.bounds(offset);
@@ -445,7 +451,7 @@ pub fn search_intersects<S: Spatial>(
 pub fn search_within<S: Spatial>(
     segment: &Segment<S>,
     offset: i32,
-    query: &[S::Coord],
+    query: &[f64],
     docs: &mut BitSet,
 ) -> io::Result<()> {
     let bounds = segment.bounds(offset);
@@ -485,7 +491,7 @@ pub fn search_within<S: Spatial>(
 pub fn search_contains<S: Spatial>(
     segment: &Segment<S>,
     offset: i32,
-    query: &[S::Coord],
+    query: &[f64],
     docs: &mut BitSet,
 ) -> io::Result<()> {
     let bounds = segment.bounds(offset);

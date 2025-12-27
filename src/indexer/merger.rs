@@ -17,7 +17,7 @@ use crate::indexer::doc_id_mapping::{MappingType, SegmentDocIdMapping};
 use crate::indexer::SegmentSerializer;
 use crate::postings::{InvertedIndexSerializer, Postings, SegmentPostings};
 use crate::schema::{value_type_to_column_type, Field, FieldType, Schema};
-use crate::spatial::envelope::{QuantizedPoint, SpatialI32, XYBounds};
+use crate::spatial::envelope::{SpatialF64, XYBounds, XY};
 use crate::store::StoreWriter;
 use crate::termdict::{TermMerger, TermOrdinal};
 use crate::{DocAddress, DocId, InvertedIndexReader};
@@ -528,7 +528,7 @@ impl IndexMerger {
         doc_id_mapping: &SegmentDocIdMapping,
     ) -> crate::Result<()> {
         use crate::spatial::bvh::{LeafPageIterator, Segment};
-        use crate::spatial::envelope::{Envelope};
+        use crate::spatial::envelope::Envelope;
 
         let Some(mut spatial_serializer) = serializer.extract_spatial_serializer() else {
             return Ok(());
@@ -546,14 +546,14 @@ impl IndexMerger {
 
         for (field, field_entry) in self.schema.fields() {
             if matches!(field_entry.field_type(), FieldType::Spatial(_)) {
-                let mut envelopes: Vec<Envelope<XYBounds<QuantizedPoint>>> = Vec::new();
+                let mut envelopes: Vec<Envelope<XYBounds<XY>>> = Vec::new();
 
                 for (segment_ord, reader) in self.readers.iter().enumerate() {
                     let spatial_readers = reader.spatial_fields();
                     let Some(spatial_reader) = spatial_readers.get_field(field)? else {
                         continue;
                     };
-                    let segment = Segment::<SpatialI32>::new(spatial_reader.get_bytes());
+                    let segment = Segment::<SpatialF64>::new(spatial_reader.get_bytes());
                     for envelope_result in LeafPageIterator::new(&segment) {
                         for envelope in envelope_result? {
                             if let Some(new_doc_id) =
