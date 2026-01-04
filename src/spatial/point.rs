@@ -8,3 +8,9 @@ pub struct GeoPoint {
     /// Latitude
     pub lat: f64,
 }
+
+impl From<GeoPoint> for (f64, f64) {
+    fn from(p: GeoPoint) -> (f64, f64) {
+        (p.lon, p.lat)
+    }
+}

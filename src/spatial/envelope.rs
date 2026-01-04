@@ -182,8 +182,10 @@ impl<B: Bounds> Envelope<B> {
     }
 }
 
-struct CompressibleDocId<'a, B: Bounds> {
-    envelopes: &'a [Envelope<B>],
+/// HUSH
+pub struct CompressibleDocId<'a, B: Bounds> {
+    /// HUSH
+    pub envelopes: &'a [Envelope<B>],
 }
 
 impl<'a, B: Bounds> Compressible for CompressibleDocId<'a, B> {
@@ -311,7 +313,6 @@ impl<B: Bounds> LeafCompression<B> for BitshuffleCompression {
         let shuffled = bitshuffle(&data, padded_count, element_size);
         let compressed = zstd::bulk::compress(&shuffled, 3)?; // level 3
         write.write_all(&(compressed.len() as u32).to_le_bytes())?;
-        write.write_all(&compressed)?;
         write.write_all(&compressed)?;
 
         Ok(())

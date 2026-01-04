@@ -9,14 +9,118 @@
 //! The serialized format stores compressed leaf pages followed by the tree structure (leaf and
 //! branch nodes), enabling zero-copy access through memory-mapped segments without upfront
 //! decompression.
+use std::collections::HashMap;
 use std::io;
 use std::io::Write;
 use std::marker::PhantomData;
 
 use common::{BitSet, CountingWriter};
+#[cfg(feature = "zstd-compression")]
+use zstd;
 
 use crate::directory::WritePtr;
-use crate::spatial::envelope::{Bounds, Envelope, LeafCompression, Spatial};
+#[cfg(feature = "zstd-compression")]
+use crate::spatial::bitshuffle::bitshuffle;
+use crate::spatial::delta::compress;
+use crate::spatial::envelope::{Bounds, CompressibleDocId, Envelope, LeafCompression, Spatial};
+use crate::DocId;
+
+/// Serialize a leaf page using bitshuffle+zstd compression.
+///
+/// # Arguments
+///
+/// * `envelopes` - Bounding areas/volumes with doc IDs, determines ordering of all sections.
+/// * `geometries` - Full geometries contained by associated bounding boxes, currently only polygon
+///   is supported for sketching.
+#[cfg(feature = "zstd-compression")]
+pub fn serialize_with_bitshuffle<B: Bounds>(
+    envelopes: &[Envelope<B>],
+    geometries: &[Vec<Vec<[f64; 2]>>],
+) -> io::Result<Vec<u8>> {
+    let mut bytes: Vec<u8> = Vec::new();
+    for envelope in envelopes {
+        bytes.extend_from_slice(&envelope.doc_id.to_le_bytes());
+    }
+    let mut count = envelopes.len();
+    for polygon in geometries {
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // bogus "polygon" type flag.
+        bytes.extend_from_slice(&polygon.len().to_le_bytes());
+        count += 2;
+        for ring in polygon {
+            bytes.extend_from_slice(&ring.len().to_le_bytes());
+            count += 1;
+        }
+    }
+    let padding_count = count.next_multiple_of(4);
+    for _ in count..padding_count {
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+    }
+    for envelope in envelopes {
+        for i in 0..B::COORDINATES {
+            bytes.extend_from_slice(&envelope.bounds.get(i).to_le_bytes());
+        }
+    }
+    for polygon in geometries {
+        for ring in polygon {
+            for point in ring {
+                bytes.extend_from_slice(&point[0].to_le_bytes());
+                bytes.extend_from_slice(&point[1].to_le_bytes());
+            }
+        }
+    }
+    // Pad to multiple of 8 elements for bitshuffle (8 * 16 = 128 bytes)
+    let element_size = 16;
+    let element_count = bytes.len() / element_size;
+    let padded_count = element_count.next_multiple_of(8);
+    bytes.resize(padded_count * element_size, 0u8);
+
+    let shuffled = bitshuffle(&bytes, padded_count, element_size);
+    let compressed = zstd::bulk::compress(&shuffled, 3)?;
+    Ok(compressed)
+}
+
+// During merge, we do make a complete copy and place it in our Geometry enum.
+
+/// HUSH
+pub fn serialize_with_delta_xor<B: Bounds>(
+    envelopes: &mut [Envelope<B>],
+    geometries: HashMap<DocId, Vec<Vec<[f64; 2]>>>,
+) -> io::Result<Vec<u8>> {
+    if envelopes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut bytes: Vec<u8> = Vec::new();
+    // Find max-spread dimension for sorting
+    let mut spreads: Vec<SpreadSurvey> = (0..B::COORDINATES)
+        .map(|_| SpreadSurvey::default())
+        .collect();
+    for envelope in envelopes.iter() {
+        for i in 0..B::COORDINATES {
+            spreads[i].survey(envelope.bounds.get(i));
+        }
+    }
+    let (dimension, _) = spreads
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.spread().total_cmp(&b.spread()))
+        .unwrap();
+    // Sort for spatial locality
+    envelopes.sort_by(|a, b| a.bounds.get(dimension).total_cmp(&b.bounds.get(dimension)));
+    // Doc IDs
+    compress(&CompressibleDocId { envelopes }, &mut bytes)?;
+    let mut descriptors: Vec<u32> = Vec::new();
+    for envelope in envelopes.iter() {
+        let polygon = geometries
+            .get(&envelope.doc_id)
+            .expect("gemoetry missing for doc");
+        descriptors.push(1);
+        descriptors.push(polygon.len() as u32);
+        for ring in polygon {
+            descriptors.push(ring.len() as u32);
+        }
+    }
+    Ok(Vec::new())
+}
 
 pub(crate) struct SpreadSurvey {
     min: f64,
@@ -264,7 +368,10 @@ const VERSION: u16 = 1u16;
 pub fn write_tree<S: Spatial>(
     envelopes: &mut [Envelope<S::Bounds>],
     write: &mut CountingWriter<WritePtr>,
-) -> io::Result<()> {
+) -> io::Result<()>
+//where
+ //   F: Fn(&[Envelope<S::Bounds>]) -> HashMap<DocId, Geometry>
+{
     write.write_all(&VERSION.to_le_bytes())?;
 
     let tree = write_leaf_pages::<S>(envelopes, write)?;
