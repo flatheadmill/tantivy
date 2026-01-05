@@ -99,6 +99,10 @@ impl QuadtreeCellId {
     /// Position = 0, level = 0, so sentinel at bit 62.
     pub const ROOT: Self = Self(1 << 62);
 
+    /// Maximum level for quadtree cells (0-30).
+    /// At level 30 with typical geographic bounds, resolution is sub-centimeter.
+    pub const MAX_LEVEL: u8 = MAX_LEVEL;
+
     /// Creates a cell ID from a raw u64 value.
     #[inline]
     pub const fn from_raw(value: u64) -> Self {
@@ -129,6 +133,74 @@ impl QuadtreeCellId {
         ((62 - sentinel_pos) / 2) as u8
     }
 
+    /// Returns the first cell at the given level.
+    ///
+    /// This is the cell at integer coordinates (0, 0) at the specified level,
+    /// which is the first cell in Z-order traversal at that level.
+    ///
+    /// # Arguments
+    ///
+    /// * `level` - The cell level (0 = root, MAX_LEVEL = finest)
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let first_leaf = QuadtreeCellId::begin(QuadtreeCellId::MAX_LEVEL);
+    /// assert_eq!(first_leaf.to_ij(), (0, 0));
+    /// ```
+    #[inline]
+    pub fn begin(level: u8) -> Self {
+        debug_assert!(level <= MAX_LEVEL);
+        Self::from_ij(0, 0, level)
+    }
+
+    /// Returns the cell just past the last cell at the given level.
+    ///
+    /// This is useful for iteration bounds. The returned value is NOT a valid
+    /// cell ID but represents the exclusive upper bound of cells at this level.
+    ///
+    /// # Arguments
+    ///
+    /// * `level` - The cell level (0 = root, MAX_LEVEL = finest)
+    #[inline]
+    pub fn end(level: u8) -> Self {
+        debug_assert!(level <= MAX_LEVEL);
+        // The "end" sentinel is one past the last valid cell
+        // At level L, there are 4^L cells, so end is at position 4^L
+        // which equals 2^(2*L)
+        let sentinel_pos = 62 - 2 * level as u32;
+        let max_position = 1u64 << (2 * level as u32);
+        Self((max_position << (sentinel_pos + 1)) | (1u64 << sentinel_pos))
+    }
+
+    /// Returns the next cell at the same level.
+    ///
+    /// Returns the cell immediately following this one in Z-order at the same
+    /// level. If this is the last cell at the level, returns `end(level)`.
+    pub fn next(&self) -> Self {
+        let level = self.level();
+        let sentinel_pos = 62 - 2 * level as u32;
+
+        // Add 1 to the position bits
+        let lsb = 1u64 << (sentinel_pos + 1);
+        Self(self.0 + lsb)
+    }
+
+    /// Returns the previous cell at the same level.
+    ///
+    /// Returns the cell immediately preceding this one in Z-order at the same
+    /// level. Panics in debug mode if called on `begin(level)`.
+    pub fn prev(&self) -> Self {
+        let level = self.level();
+        let sentinel_pos = 62 - 2 * level as u32;
+
+        debug_assert!(self.0 > Self::begin(level).0, "prev() called on begin()");
+
+        // Subtract 1 from the position bits
+        let lsb = 1u64 << (sentinel_pos + 1);
+        Self(self.0 - lsb)
+    }
+
     /// Creates a cell ID from normalized coordinates at the given level.
     ///
     /// Coordinates should be in [0, 1) range. Values exactly at 1.0 are
@@ -148,6 +220,32 @@ impl QuadtreeCellId {
         Self::from_ij(ix, iy, level)
     }
 
+    /// Creates a cell ID from world (x, y) coordinates at the given level.
+    ///
+    /// This is a convenience method that normalizes coordinates using the provided
+    /// bounds before creating the cell ID. The coordinates are first converted to
+    /// the [0, 1) normalized space, then mapped to the appropriate cell.
+    ///
+    /// # Arguments
+    ///
+    /// * `x` - The x-coordinate in world space
+    /// * `y` - The y-coordinate in world space
+    /// * `level` - The cell level (0 = root, MAX_LEVEL = finest)
+    /// * `bounds` - The global bounds used for coordinate normalization
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let bounds = Bounds::new(0.0, 0.0, 100.0, 100.0);
+    /// let cell = QuadtreeCellId::from_xy(50.0, 50.0, 5, &bounds);
+    /// // Creates cell containing the center point at level 5
+    /// ```
+    pub fn from_xy(x: f64, y: f64, level: u8, bounds: &Bounds) -> Self {
+        let point = Point2D::new(x, y);
+        let normalized = bounds.normalize(&point);
+        Self::from_normalized(normalized.x, normalized.y, level)
+    }
+
     /// Creates a cell ID from integer (i, j) coordinates at the given level.
     ///
     /// i is the x-coordinate (column), j is the y-coordinate (row).
@@ -159,17 +257,6 @@ impl QuadtreeCellId {
 
         // Interleave i and j bits to create Z-order (Morton) code
         let position = interleave_bits(i, j);
-
-        // Shift position to top and add sentinel
-        // Position uses 2*level bits, starting at bit 62 (just below bit 63)
-        let shift = 62 - 2 * level as u32;
-        let id = (position << shift) | (1u64 << shift.saturating_sub(1).max(0));
-
-        // Actually, let's reconsider the encoding:
-        // For level L, we have 2*L position bits at the top, then a sentinel 1.
-        // The sentinel is at bit (62 - 2*L).
-        // But we need position bits in 63..(64-2*L), sentinel at (62-2*L).
-        // Hmm, let me think again...
 
         // Simpler approach: position in high bits, sentinel marks end
         let sentinel_pos = 62 - 2 * level as u32;
@@ -286,6 +373,20 @@ impl QuadtreeCellId {
         let dj = ((index >> 1) & 1) as u32;
 
         Some(Self::from_ij(2 * i + di, 2 * j + dj, level + 1))
+    }
+
+    /// Returns which child (0-3) this cell is of its parent.
+    ///
+    /// Returns the child index in Z-order:
+    /// - 0: bottom-left  (i even, j even)
+    /// - 1: bottom-right (i odd, j even)
+    /// - 2: top-left     (i even, j odd)
+    /// - 3: top-right    (i odd, j odd)
+    ///
+    /// Returns 0 for the root cell (which has no parent).
+    pub fn child_position(&self) -> usize {
+        let (i, j) = self.to_ij();
+        ((i & 1) | ((j & 1) << 1)) as usize
     }
 
     /// Returns the minimum cell ID in the range covered by this cell.

@@ -1,6 +1,8 @@
 //! HUSH
 
-use crate::spatial::quadtree::{brute_force_contains_2d, Bounds, EdgeCrosser2D, Point2D, QuadtreeCellId};
+use crate::spatial::quadtree::{
+    brute_force_contains_2d, Bounds, EdgeCrosser2D, Point2D, QuadtreeCellId,
+};
 
 /// An efficient set of shape IDs optimized for very small cardinality.
 ///
@@ -447,7 +449,8 @@ impl InteriorTracker {
     ///
     /// This only affects state for shape_ids < `limit_shape_id`.
     pub fn restore_state_before(&mut self, limit_shape_id: u32) {
-        self.shape_ids.restore_before(limit_shape_id, &self.saved_ids);
+        self.shape_ids
+            .restore_before(limit_shape_id, &self.saved_ids);
         self.saved_ids.clear();
         self.is_active = self.saved_is_active;
     }
@@ -683,7 +686,6 @@ mod interior_tracker_tests {
     // -------------------------------------------------------------------------
     // InteriorTracker Tests
     // -------------------------------------------------------------------------
-
     mod tracker_tests {
         use super::*;
 
@@ -762,22 +764,31 @@ mod interior_tracker_tests {
             assert!(!tracker.shape_contains_focus(1));
 
             // Move focus from origin (-1, -1) to (30, 30)
-            // This crosses the left edge of the square at x=10
+            // This ray passes through vertex (10, 10) which is shared
+            // between the bottom edge and left edge of the square
             let square = unit_square();
             tracker.draw_to(&Point2D::new(30.0, 30.0));
 
-            // Test the left edge of the square: (10, 10) to (10, 50)
-            // Actually the left edge is (10, 50) to (10, 10) in reverse order
-            // Let's use the bottom edge: (10, 10) to (50, 10)
-            // The ray from (-1, -1) to (30, 30) crosses this bottom edge
-            tracker.test_edge(1, &square[0], &square[1]); // bottom edge
+            // Test ALL edges - the vertex crossing rules ensure that the
+            // crossing at vertex (10, 10) is counted exactly once, on the
+            // left edge (because (10, 50) is to the left of the ray)
+            let n = square.len();
+            for i in 0..n {
+                tracker.test_edge(1, &square[i], &square[(i + 1) % n]);
+            }
 
-            // After crossing one edge of a polygon, we should now be inside
-            // (odd number of crossings)
+            // After crossing the boundary once (via left edge), we're inside
             assert!(tracker.shape_contains_focus(1));
 
-            // Cross another edge to go back outside
-            tracker.test_edge(1, &square[3], &square[0]); // left edge
+            // Draw to a point outside the square
+            tracker.draw_to(&Point2D::new(60.0, 60.0));
+
+            // Test all edges again
+            for i in 0..n {
+                tracker.test_edge(1, &square[i], &square[(i + 1) % n]);
+            }
+
+            // After crossing the boundary again, we're outside
             assert!(!tracker.shape_contains_focus(1));
         }
 
@@ -822,9 +833,11 @@ mod interior_tracker_tests {
             let bounds = test_bounds();
             let mut tracker = InteriorTracker::new(&bounds);
 
-            let cell = QuadtreeCellId::from_xy(0.5, 0.5, 5, &bounds);
+            // Use world coordinates (50.0, 50.0) which normalize to (0.5, 0.5)
+            // This creates a cell at the CENTER of the space, not at the origin
+            let cell = QuadtreeCellId::from_xy(50.0, 50.0, 5, &bounds);
 
-            // Initially not at the cell
+            // Initially not at the cell (next_cellid is at origin)
             assert!(!tracker.at_cellid(cell));
 
             // Set next cellid
@@ -834,7 +847,7 @@ mod interior_tracker_tests {
             assert!(tracker.at_cellid(cell));
 
             // But not for a different cell
-            let other_cell = QuadtreeCellId::from_xy(0.75, 0.75, 5, &bounds);
+            let other_cell = QuadtreeCellId::from_xy(75.0, 75.0, 5, &bounds);
             assert!(!tracker.at_cellid(other_cell));
         }
 
