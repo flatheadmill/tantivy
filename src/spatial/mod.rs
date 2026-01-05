@@ -11,6 +11,7 @@ pub mod quadtree;
 pub mod radix_select;
 pub mod reader;
 pub mod serializer;
+pub mod spatial_index_manager;
 pub mod view;
 pub mod writer;
 pub mod xor;
