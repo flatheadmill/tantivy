@@ -248,6 +248,7 @@ pub fn signed_edge_crossing_2d(a: &Point2D, b: &Point2D, c: &Point2D, d: &Point2
 ///     }
 /// }
 /// ```
+#[derive(Debug)]
 pub struct EdgeCrosser2D {
     // Fixed edge AB
     a: Point2D,

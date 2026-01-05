@@ -8,6 +8,7 @@ mod cell_id;
 mod geometry;
 mod index;
 mod predicates;
+mod interior_tracker;
 
 pub use cell_id::{QuadtreeCellId, MAX_LEVEL};
 pub use geometry::{Bounds, Interval, Point2D, Rect};
