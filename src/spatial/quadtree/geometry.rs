@@ -2,12 +2,15 @@
 // Point2D - 2D Point and Vector Operations
 // =============================================================================
 
+use std::ops::{Add, Mul, Neg, Sub};
+
 /// A 2D point or vector with f64 coordinates.
 ///
 /// Used for both positions and directions in the plane.
 /// Implements basic vector operations: addition, subtraction, scaling,
 /// dot product, cross product (2D determinant), and normalization.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(missing_docs)]
 pub struct Point2D {
     pub x: f64,
     pub y: f64,
@@ -181,6 +184,7 @@ impl Neg for Point2D {
 /// All points indexed by the quadtree must fall within these bounds.
 /// The bounds are used to normalize coordinates to [0, 1] for cell ID encoding.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(missing_docs)]
 pub struct Bounds {
     pub min_x: f64,
     pub min_y: f64,
@@ -314,6 +318,7 @@ impl Bounds {
 
 /// A closed 1D interval [lo, hi].
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(missing_docs)]
 pub struct Interval {
     pub lo: f64,
     pub hi: f64,
@@ -421,6 +426,7 @@ impl Interval {
 
 /// An axis-aligned rectangle defined by x and y intervals.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(missing_docs)]
 pub struct Rect {
     pub x: Interval,
     pub y: Interval,
@@ -584,7 +590,6 @@ impl Rect {
 }
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::*;
 
     // -------------------------------------------------------------------------

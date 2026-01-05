@@ -1,6 +1,11 @@
 // =============================================================================
 // ClippedShape - Per-Shape Data Within a Cell
 // =============================================================================
+use smallvec::SmallVec;
+
+use crate::spatial::quadtree::{
+    edge_or_vertex_crossing_2d, Bounds, Interval, Point2D, QuadtreeCellId, Rect,
+};
 
 /// Per-shape data within a quadtree cell.
 ///
@@ -696,5 +701,510 @@ impl PaddedCell {
         }
 
         false
+    }
+}
+#[cfg(test)]
+mod index_structure_tests {
+    use super::*;
+
+    // -------------------------------------------------------------------------
+    // ClippedShape Tests
+    // -------------------------------------------------------------------------
+
+    mod clipped_shape_tests {
+        use super::*;
+
+        #[test]
+        fn test_new() {
+            let shape = ClippedShape::new(42, true);
+            assert_eq!(shape.doc_id(), 42);
+            assert!(shape.contains_center());
+            assert_eq!(shape.num_edges(), 0);
+            assert!(shape.is_empty());
+        }
+
+        #[test]
+        fn test_with_capacity() {
+            let shape = ClippedShape::with_capacity(10, false, 8);
+            assert_eq!(shape.doc_id(), 10);
+            assert!(!shape.contains_center());
+            assert_eq!(shape.num_edges(), 0);
+        }
+
+        #[test]
+        fn test_add_edge_maintains_order() {
+            let mut shape = ClippedShape::new(1, false);
+
+            shape.add_edge(5);
+            shape.add_edge(2);
+            shape.add_edge(8);
+            shape.add_edge(1);
+
+            assert_eq!(shape.num_edges(), 4);
+            assert_eq!(shape.edges(), &[1, 2, 5, 8]);
+        }
+
+        #[test]
+        fn test_add_edge_no_duplicates() {
+            let mut shape = ClippedShape::new(1, false);
+
+            shape.add_edge(3);
+            shape.add_edge(3); // Duplicate
+            shape.add_edge(5);
+            shape.add_edge(3); // Duplicate
+
+            assert_eq!(shape.num_edges(), 2);
+            assert_eq!(shape.edges(), &[3, 5]);
+        }
+
+        #[test]
+        fn test_add_edges_bulk() {
+            let mut shape = ClippedShape::new(1, false);
+
+            shape.add_edges(&[5, 2, 8, 1, 5]); // 5 appears twice
+
+            assert_eq!(shape.num_edges(), 4);
+            assert_eq!(shape.edges(), &[1, 2, 5, 8]);
+        }
+
+        #[test]
+        fn test_contains_edge() {
+            let mut shape = ClippedShape::new(1, false);
+            shape.add_edges(&[2, 4, 6, 8]);
+
+            assert!(shape.contains_edge(2));
+            assert!(shape.contains_edge(4));
+            assert!(shape.contains_edge(6));
+            assert!(shape.contains_edge(8));
+            assert!(!shape.contains_edge(1));
+            assert!(!shape.contains_edge(3));
+            assert!(!shape.contains_edge(5));
+        }
+
+        #[test]
+        fn test_set_contains_center() {
+            let mut shape = ClippedShape::new(1, false);
+            assert!(!shape.contains_center());
+
+            shape.set_contains_center(true);
+            assert!(shape.contains_center());
+
+            shape.set_contains_center(false);
+            assert!(!shape.contains_center());
+        }
+
+        #[test]
+        fn test_clear_edges() {
+            let mut shape = ClippedShape::new(1, true);
+            shape.add_edges(&[1, 2, 3]);
+
+            assert_eq!(shape.num_edges(), 3);
+            assert!(shape.contains_center());
+
+            shape.clear_edges();
+
+            assert_eq!(shape.num_edges(), 0);
+            assert!(shape.contains_center()); // Preserved
+        }
+
+        #[test]
+        fn test_equality() {
+            let mut shape1 = ClippedShape::new(1, true);
+            shape1.add_edges(&[1, 2, 3]);
+
+            let mut shape2 = ClippedShape::new(1, true);
+            shape2.add_edges(&[1, 2, 3]);
+
+            let mut shape3 = ClippedShape::new(1, true);
+            shape3.add_edges(&[1, 2, 4]);
+
+            assert_eq!(shape1, shape2);
+            assert_ne!(shape1, shape3);
+        }
+
+        #[test]
+        fn test_inline_vs_heap() {
+            // SmallVec<[u16; 2]> stores up to 2 elements inline
+            let mut shape = ClippedShape::new(1, false);
+
+            // These should be inline
+            shape.add_edge(1);
+            shape.add_edge(2);
+            assert_eq!(shape.num_edges(), 2);
+
+            // This forces heap allocation
+            shape.add_edge(3);
+            assert_eq!(shape.num_edges(), 3);
+            assert_eq!(shape.edges(), &[1, 2, 3]);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // QuadtreeCell Tests
+    // -------------------------------------------------------------------------
+
+    mod quadtree_cell_tests {
+        use super::*;
+
+        #[test]
+        fn test_new() {
+            let cell = QuadtreeCell::new(QuadtreeCellId::ROOT);
+            assert_eq!(cell.cell_id(), QuadtreeCellId::ROOT);
+            assert_eq!(cell.num_shapes(), 0);
+            assert!(cell.is_empty());
+        }
+
+        #[test]
+        fn test_add_shape_maintains_order() {
+            let mut cell = QuadtreeCell::new(QuadtreeCellId::ROOT);
+
+            cell.add_shape(ClippedShape::new(30, false));
+            cell.add_shape(ClippedShape::new(10, true));
+            cell.add_shape(ClippedShape::new(50, false));
+            cell.add_shape(ClippedShape::new(20, true));
+
+            assert_eq!(cell.num_shapes(), 4);
+
+            let doc_ids: Vec<u32> = cell.shapes().iter().map(|s| s.doc_id()).collect();
+            assert_eq!(doc_ids, vec![10, 20, 30, 50]);
+        }
+
+        #[test]
+        fn test_add_shape_replaces_existing() {
+            let mut cell = QuadtreeCell::new(QuadtreeCellId::ROOT);
+
+            let mut shape1 = ClippedShape::new(10, false);
+            shape1.add_edge(1);
+            cell.add_shape(shape1);
+
+            assert_eq!(cell.num_shapes(), 1);
+            assert!(!cell.shapes()[0].contains_center());
+
+            // Replace with new shape having same doc_id
+            let mut shape2 = ClippedShape::new(10, true);
+            shape2.add_edge(2);
+            cell.add_shape(shape2);
+
+            assert_eq!(cell.num_shapes(), 1);
+            assert!(cell.shapes()[0].contains_center());
+            assert_eq!(cell.shapes()[0].edges(), &[2]);
+        }
+
+        #[test]
+        fn test_find_shape() {
+            let mut cell = QuadtreeCell::new(QuadtreeCellId::ROOT);
+
+            cell.add_shape(ClippedShape::new(10, true));
+            cell.add_shape(ClippedShape::new(20, false));
+            cell.add_shape(ClippedShape::new(30, true));
+
+            let found = cell.find_shape(20);
+            assert!(found.is_some());
+            assert_eq!(found.unwrap().doc_id(), 20);
+            assert!(!found.unwrap().contains_center());
+
+            assert!(cell.find_shape(15).is_none());
+            assert!(cell.find_shape(25).is_none());
+        }
+
+        #[test]
+        fn test_get_or_create_shape() {
+            let mut cell = QuadtreeCell::new(QuadtreeCellId::ROOT);
+
+            // Create new
+            let shape = cell.get_or_create_shape(10);
+            assert_eq!(shape.doc_id(), 10);
+            assert!(!shape.contains_center());
+            shape.set_contains_center(true);
+
+            // Get existing
+            let shape_again = cell.get_or_create_shape(10);
+            assert!(shape_again.contains_center());
+
+            assert_eq!(cell.num_shapes(), 1);
+        }
+
+        #[test]
+        fn test_remove_shape() {
+            let mut cell = QuadtreeCell::new(QuadtreeCellId::ROOT);
+
+            cell.add_shape(ClippedShape::new(10, true));
+            cell.add_shape(ClippedShape::new(20, false));
+            cell.add_shape(ClippedShape::new(30, true));
+
+            let removed = cell.remove_shape(20);
+            assert!(removed.is_some());
+            assert_eq!(removed.unwrap().doc_id(), 20);
+
+            assert_eq!(cell.num_shapes(), 2);
+            assert!(cell.find_shape(20).is_none());
+
+            // Remove non-existent
+            let not_found = cell.remove_shape(25);
+            assert!(not_found.is_none());
+        }
+
+        #[test]
+        fn test_total_edges() {
+            let mut cell = QuadtreeCell::new(QuadtreeCellId::ROOT);
+
+            let mut shape1 = ClippedShape::new(10, false);
+            shape1.add_edges(&[1, 2, 3]);
+            cell.add_shape(shape1);
+
+            let mut shape2 = ClippedShape::new(20, false);
+            shape2.add_edges(&[4, 5]);
+            cell.add_shape(shape2);
+
+            let shape3 = ClippedShape::new(30, true); // No edges
+            cell.add_shape(shape3);
+
+            assert_eq!(cell.total_edges(), 5);
+        }
+
+        #[test]
+        fn test_doc_ids_iterator() {
+            let mut cell = QuadtreeCell::new(QuadtreeCellId::ROOT);
+
+            cell.add_shape(ClippedShape::new(10, true));
+            cell.add_shape(ClippedShape::new(20, false));
+            cell.add_shape(ClippedShape::new(30, true));
+
+            let doc_ids: Vec<(u32, bool)> = cell.doc_ids().collect();
+            assert_eq!(doc_ids, vec![(10, true), (20, false), (30, true)]);
+        }
+
+        #[test]
+        fn test_clear() {
+            let mut cell = QuadtreeCell::new(QuadtreeCellId::ROOT);
+
+            cell.add_shape(ClippedShape::new(10, true));
+            cell.add_shape(ClippedShape::new(20, false));
+
+            assert_eq!(cell.num_shapes(), 2);
+
+            cell.clear();
+
+            assert_eq!(cell.num_shapes(), 0);
+            assert!(cell.is_empty());
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // PaddedCell Tests
+    // -------------------------------------------------------------------------
+
+    mod padded_cell_tests {
+        use super::*;
+
+        fn test_bounds() -> Bounds {
+            Bounds::new(0.0, 0.0, 100.0, 100.0)
+        }
+
+        #[test]
+        fn test_new_root() {
+            let bounds = test_bounds();
+            let cell = PaddedCell::new(QuadtreeCellId::ROOT, 0.5, &bounds);
+
+            assert_eq!(cell.id(), QuadtreeCellId::ROOT);
+            assert_eq!(cell.level(), 0);
+            assert_eq!(cell.padding(), 0.5);
+
+            // Root bounds should cover entire space
+            assert!((cell.bounds().x.lo - 0.0).abs() < 1e-10);
+            assert!((cell.bounds().x.hi - 100.0).abs() < 1e-10);
+            assert!((cell.bounds().y.lo - 0.0).abs() < 1e-10);
+            assert!((cell.bounds().y.hi - 100.0).abs() < 1e-10);
+
+            // Padded bounds should be expanded
+            assert!((cell.padded_bounds().x.lo - (-0.5)).abs() < 1e-10);
+            assert!((cell.padded_bounds().x.hi - 100.5).abs() < 1e-10);
+
+            // Center
+            assert!((cell.center().x - 50.0).abs() < 1e-10);
+            assert!((cell.center().y - 50.0).abs() < 1e-10);
+        }
+
+        #[test]
+        fn test_child() {
+            let bounds = test_bounds();
+            let root = PaddedCell::new(QuadtreeCellId::ROOT, 0.5, &bounds);
+
+            // Child 0: bottom-left
+            let child0 = root.child(0).unwrap();
+            assert_eq!(child0.level(), 1);
+            assert!((child0.bounds().x.lo - 0.0).abs() < 1e-10);
+            assert!((child0.bounds().x.hi - 50.0).abs() < 1e-10);
+            assert!((child0.bounds().y.lo - 0.0).abs() < 1e-10);
+            assert!((child0.bounds().y.hi - 50.0).abs() < 1e-10);
+
+            // Child 1: bottom-right
+            let child1 = root.child(1).unwrap();
+            assert!((child1.bounds().x.lo - 50.0).abs() < 1e-10);
+            assert!((child1.bounds().x.hi - 100.0).abs() < 1e-10);
+            assert!((child1.bounds().y.lo - 0.0).abs() < 1e-10);
+            assert!((child1.bounds().y.hi - 50.0).abs() < 1e-10);
+
+            // Child 2: top-left
+            let child2 = root.child(2).unwrap();
+            assert!((child2.bounds().x.lo - 0.0).abs() < 1e-10);
+            assert!((child2.bounds().x.hi - 50.0).abs() < 1e-10);
+            assert!((child2.bounds().y.lo - 50.0).abs() < 1e-10);
+            assert!((child2.bounds().y.hi - 100.0).abs() < 1e-10);
+
+            // Child 3: top-right
+            let child3 = root.child(3).unwrap();
+            assert!((child3.bounds().x.lo - 50.0).abs() < 1e-10);
+            assert!((child3.bounds().x.hi - 100.0).abs() < 1e-10);
+            assert!((child3.bounds().y.lo - 50.0).abs() < 1e-10);
+            assert!((child3.bounds().y.hi - 100.0).abs() < 1e-10);
+        }
+
+        #[test]
+        fn test_children() {
+            let bounds = test_bounds();
+            let root = PaddedCell::new(QuadtreeCellId::ROOT, 0.5, &bounds);
+
+            let children = root.children().unwrap();
+            assert_eq!(children.len(), 4);
+
+            for (i, child) in children.iter().enumerate() {
+                assert_eq!(child.level(), 1);
+                assert_eq!(child.id(), root.id().child(i).unwrap());
+            }
+        }
+
+        #[test]
+        fn test_entry_exit_vertices() {
+            let bounds = test_bounds();
+            let root = PaddedCell::new(QuadtreeCellId::ROOT, 0.5, &bounds);
+
+            let entry = root.entry_vertex();
+            let exit = root.exit_vertex();
+
+            // Z-order: entry at (0,0), exit at (1,1)
+            assert_eq!(entry, Point2D::new(0.0, 0.0));
+            assert_eq!(exit, Point2D::new(100.0, 100.0));
+        }
+
+        #[test]
+        fn test_middle() {
+            let bounds = test_bounds();
+            let mut root = PaddedCell::new(QuadtreeCellId::ROOT, 0.5, &bounds);
+
+            let middle = root.middle();
+
+            // Middle should be the region within padding of the center
+            assert!((middle.x.lo - (50.0 - 0.5)).abs() < 1e-10);
+            assert!((middle.x.hi - (50.0 + 0.5)).abs() < 1e-10);
+            assert!((middle.y.lo - (50.0 - 0.5)).abs() < 1e-10);
+            assert!((middle.y.hi - (50.0 + 0.5)).abs() < 1e-10);
+
+            // Should be cached (same result)
+            let middle2 = root.middle();
+            assert_eq!(middle, middle2);
+        }
+
+        #[test]
+        fn test_child_ij() {
+            let bounds = test_bounds();
+            let cell = PaddedCell::new(QuadtreeCellId::ROOT, 0.5, &bounds);
+
+            assert_eq!(cell.child_ij(0), (0, 0));
+            assert_eq!(cell.child_ij(1), (1, 0));
+            assert_eq!(cell.child_ij(2), (0, 1));
+            assert_eq!(cell.child_ij(3), (1, 1));
+        }
+
+        #[test]
+        fn test_ij_to_child_index() {
+            assert_eq!(PaddedCell::ij_to_child_index(0, 0), 0);
+            assert_eq!(PaddedCell::ij_to_child_index(1, 0), 1);
+            assert_eq!(PaddedCell::ij_to_child_index(0, 1), 2);
+            assert_eq!(PaddedCell::ij_to_child_index(1, 1), 3);
+        }
+
+        #[test]
+        fn test_contains_point() {
+            let bounds = test_bounds();
+            let cell = PaddedCell::new(QuadtreeCellId::ROOT, 0.5, &bounds);
+
+            // Inside bounds
+            assert!(cell.contains_point(&Point2D::new(50.0, 50.0)));
+
+            // Inside padding but outside bounds
+            assert!(cell.contains_point(&Point2D::new(-0.25, 50.0)));
+
+            // Outside padding
+            assert!(!cell.contains_point(&Point2D::new(-1.0, 50.0)));
+        }
+
+        #[test]
+        fn test_intersects_edge() {
+            let bounds = test_bounds();
+            let cell = PaddedCell::new(QuadtreeCellId::ROOT, 0.5, &bounds);
+
+            // Edge entirely inside
+            let v0_inside = Point2D::new(10.0, 10.0);
+            let v1_inside = Point2D::new(90.0, 90.0);
+            assert!(cell.intersects_edge(&v0_inside, &v1_inside));
+
+            // Edge crossing boundary
+            let v0_cross = Point2D::new(-10.0, 50.0);
+            let v1_cross = Point2D::new(10.0, 50.0);
+            assert!(cell.intersects_edge(&v0_cross, &v1_cross));
+
+            // Edge entirely outside
+            let v0_outside = Point2D::new(-10.0, -10.0);
+            let v1_outside = Point2D::new(-5.0, -5.0);
+            assert!(!cell.intersects_edge(&v0_outside, &v1_outside));
+        }
+
+        #[test]
+        fn test_shrink_to_fit_single_child() {
+            let bounds = test_bounds();
+            let root = PaddedCell::new(QuadtreeCellId::ROOT, 0.5, &bounds);
+
+            // Rect entirely in bottom-left quadrant
+            let rect = Rect::from_coords(5.0, 5.0, 20.0, 20.0);
+            let shrunk = root.shrink_to_fit(&rect, &bounds);
+
+            // Should descend to the bottom-left child
+            assert!(shrunk.level() >= 1);
+
+            // The shrunk cell should contain the rect
+            let shrunk_bounds = shrunk.to_bounds(&bounds);
+            assert!(shrunk_bounds.contains_rect(&rect));
+        }
+
+        #[test]
+        fn test_shrink_to_fit_spanning_multiple() {
+            let bounds = test_bounds();
+            let root = PaddedCell::new(QuadtreeCellId::ROOT, 0.5, &bounds);
+
+            // Rect spanning multiple quadrants
+            let rect = Rect::from_coords(40.0, 40.0, 60.0, 60.0);
+            let shrunk = root.shrink_to_fit(&rect, &bounds);
+
+            // Should stay at root because rect spans all quadrants
+            assert_eq!(shrunk, QuadtreeCellId::ROOT);
+        }
+
+        #[test]
+        fn test_padding_consistency() {
+            let bounds = test_bounds();
+            let root = PaddedCell::new(QuadtreeCellId::ROOT, 1.0, &bounds);
+
+            // All children should have the same padding
+            let children = root.children().unwrap();
+            for child in &children {
+                assert_eq!(child.padding(), 1.0);
+
+                let grandchildren = child.children().unwrap();
+                for gc in &grandchildren {
+                    assert_eq!(gc.padding(), 1.0);
+                }
+            }
+        }
     }
 }

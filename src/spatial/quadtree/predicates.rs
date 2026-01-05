@@ -1,3 +1,5 @@
+use crate::spatial::quadtree::Point2D;
+
 /// Returns the signed area of triangle ABC (×2).
 ///
 /// Positive: C is left of A→B (counterclockwise turn)
@@ -14,56 +16,6 @@ fn orientation(a: &(f64, f64), b: &(f64, f64), c: &(f64, f64)) -> f64 {
     )
 }
 
-/// Interleaves bits of two 32-bit values into a 64-bit Z-order code.
-///
-/// The result has bits of x in even positions and bits of y in odd positions.
-fn interleave_bits(x: u32, y: u32) -> u64 {
-    let mut x = x as u64;
-    let mut y = y as u64;
-
-    // Spread x bits: 0000abcd -> 0a0b0c0d
-    x = (x | (x << 16)) & 0x0000_FFFF_0000_FFFF;
-    x = (x | (x << 8)) & 0x00FF_00FF_00FF_00FF;
-    x = (x | (x << 4)) & 0x0F0F_0F0F_0F0F_0F0F;
-    x = (x | (x << 2)) & 0x3333_3333_3333_3333;
-    x = (x | (x << 1)) & 0x5555_5555_5555_5555;
-
-    // Spread y bits
-    y = (y | (y << 16)) & 0x0000_FFFF_0000_FFFF;
-    y = (y | (y << 8)) & 0x00FF_00FF_00FF_00FF;
-    y = (y | (y << 4)) & 0x0F0F_0F0F_0F0F_0F0F;
-    y = (y | (y << 2)) & 0x3333_3333_3333_3333;
-    y = (y | (y << 1)) & 0x5555_5555_5555_5555;
-
-    // Combine: x in even bits, y in odd bits
-    x | (y << 1)
-}
-
-/// Deinterleaves a Z-order code back into (x, y) coordinates.
-fn deinterleave_bits(z: u64, level: u8) -> (u32, u32) {
-    let mask = (1u64 << (2 * level as u32)) - 1;
-    let z = z & mask;
-
-    // Extract even bits (x) and odd bits (y)
-    let mut x = z & 0x5555_5555_5555_5555;
-    let mut y = (z >> 1) & 0x5555_5555_5555_5555;
-
-    // Compact x bits
-    x = (x | (x >> 1)) & 0x3333_3333_3333_3333;
-    x = (x | (x >> 2)) & 0x0F0F_0F0F_0F0F_0F0F;
-    x = (x | (x >> 4)) & 0x00FF_00FF_00FF_00FF;
-    x = (x | (x >> 8)) & 0x0000_FFFF_0000_FFFF;
-    x = (x | (x >> 16)) & 0x0000_0000_FFFF_FFFF;
-
-    // Compact y bits
-    y = (y | (y >> 1)) & 0x3333_3333_3333_3333;
-    y = (y | (y >> 2)) & 0x0F0F_0F0F_0F0F_0F0F;
-    y = (y | (y >> 4)) & 0x00FF_00FF_00FF_00FF;
-    y = (y | (y >> 8)) & 0x0000_FFFF_0000_FFFF;
-    y = (y | (y >> 16)) & 0x0000_0000_FFFF_FFFF;
-
-    (x as u32, y as u32)
-}
 // =============================================================================
 // Orientation Predicate
 // =============================================================================
@@ -638,4 +590,425 @@ pub fn contains_with_edges_2d(
     }
 
     inside
+}
+#[cfg(test)]
+mod predicate_tests {
+    use super::*;
+
+    // -------------------------------------------------------------------------
+    // Orientation Tests
+    // -------------------------------------------------------------------------
+
+    mod orientation_tests {
+        use super::*;
+
+        #[test]
+        fn test_orient_2d_ccw() {
+            // Counterclockwise triangle
+            let a = Point2D::new(0.0, 0.0);
+            let b = Point2D::new(1.0, 0.0);
+            let c = Point2D::new(0.5, 1.0);
+
+            assert_eq!(orient_2d(&a, &b, &c), 1);
+        }
+
+        #[test]
+        fn test_orient_2d_cw() {
+            // Clockwise triangle
+            let a = Point2D::new(0.0, 0.0);
+            let b = Point2D::new(0.5, 1.0);
+            let c = Point2D::new(1.0, 0.0);
+
+            assert_eq!(orient_2d(&a, &b, &c), -1);
+        }
+
+        #[test]
+        fn test_orient_2d_collinear() {
+            // Collinear points
+            let a = Point2D::new(0.0, 0.0);
+            let b = Point2D::new(1.0, 1.0);
+            let c = Point2D::new(2.0, 2.0);
+
+            assert_eq!(orient_2d(&a, &b, &c), 0);
+        }
+
+        #[test]
+        fn test_orient_2d_rotation_invariant() {
+            // Sign should be preserved under rotation of arguments
+            let a = Point2D::new(0.0, 0.0);
+            let b = Point2D::new(1.0, 0.0);
+            let c = Point2D::new(0.5, 1.0);
+
+            let sign_abc = orient_2d(&a, &b, &c);
+            let sign_bca = orient_2d(&b, &c, &a);
+            let sign_cab = orient_2d(&c, &a, &b);
+
+            assert_eq!(sign_abc, sign_bca);
+            assert_eq!(sign_bca, sign_cab);
+        }
+
+        #[test]
+        fn test_orient_2d_swap_inverts() {
+            // Swapping two arguments should negate the result
+            let a = Point2D::new(0.0, 0.0);
+            let b = Point2D::new(1.0, 0.0);
+            let c = Point2D::new(0.5, 1.0);
+
+            let sign_abc = orient_2d(&a, &b, &c);
+            let sign_bac = orient_2d(&b, &a, &c);
+
+            assert_eq!(sign_abc, -sign_bac);
+        }
+
+        #[test]
+        fn test_orient_2d_nearly_collinear() {
+            // Nearly collinear points should still give correct sign
+            let a = Point2D::new(0.0, 0.0);
+            let b = Point2D::new(1.0, 0.0);
+            let c = Point2D::new(0.5, 1e-15); // Very slightly above the line
+
+            // Should be CCW (positive)
+            assert_eq!(orient_2d(&a, &b, &c), 1);
+
+            let d = Point2D::new(0.5, -1e-15); // Very slightly below the line
+            assert_eq!(orient_2d(&a, &b, &d), -1);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Edge Crossing Tests
+    // -------------------------------------------------------------------------
+
+    mod crossing_tests {
+        use super::*;
+
+        #[test]
+        fn test_crossing_sign_proper_cross() {
+            // Two segments that properly cross
+            let a = Point2D::new(0.0, 0.0);
+            let b = Point2D::new(2.0, 2.0);
+            let c = Point2D::new(0.0, 2.0);
+            let d = Point2D::new(2.0, 0.0);
+
+            assert_eq!(crossing_sign_2d(&a, &b, &c, &d), 1);
+        }
+
+        #[test]
+        fn test_crossing_sign_no_cross_parallel() {
+            // Parallel segments
+            let a = Point2D::new(0.0, 0.0);
+            let b = Point2D::new(2.0, 0.0);
+            let c = Point2D::new(0.0, 1.0);
+            let d = Point2D::new(2.0, 1.0);
+
+            assert_eq!(crossing_sign_2d(&a, &b, &c, &d), -1);
+        }
+
+        #[test]
+        fn test_crossing_sign_no_cross_disjoint() {
+            // Disjoint segments
+            let a = Point2D::new(0.0, 0.0);
+            let b = Point2D::new(1.0, 0.0);
+            let c = Point2D::new(2.0, 0.0);
+            let d = Point2D::new(3.0, 0.0);
+
+            assert_eq!(crossing_sign_2d(&a, &b, &c, &d), -1);
+        }
+
+        #[test]
+        fn test_crossing_sign_shared_vertex() {
+            // Segments share a vertex
+            let a = Point2D::new(0.0, 0.0);
+            let b = Point2D::new(1.0, 1.0);
+            let c = Point2D::new(1.0, 1.0);
+            let d = Point2D::new(2.0, 0.0);
+
+            assert_eq!(crossing_sign_2d(&a, &b, &c, &d), 0);
+        }
+
+        #[test]
+        fn test_crossing_sign_t_intersection() {
+            // T-intersection: one endpoint on the other segment
+            let a = Point2D::new(0.0, 0.0);
+            let b = Point2D::new(2.0, 0.0);
+            let c = Point2D::new(1.0, 0.0);
+            let d = Point2D::new(1.0, 1.0);
+
+            // This is collinear (c is on AB), should return -1
+            assert_eq!(crossing_sign_2d(&a, &b, &c, &d), -1);
+        }
+
+        #[test]
+        fn test_crossing_sign_symmetric() {
+            // crossing_sign(a,b,c,d) == crossing_sign(c,d,a,b)
+            let a = Point2D::new(0.0, 0.0);
+            let b = Point2D::new(2.0, 2.0);
+            let c = Point2D::new(0.0, 2.0);
+            let d = Point2D::new(2.0, 0.0);
+
+            assert_eq!(
+                crossing_sign_2d(&a, &b, &c, &d),
+                crossing_sign_2d(&c, &d, &a, &b)
+            );
+        }
+
+        #[test]
+        fn test_edge_or_vertex_crossing_proper() {
+            let a = Point2D::new(0.0, 0.0);
+            let b = Point2D::new(2.0, 2.0);
+            let c = Point2D::new(0.0, 2.0);
+            let d = Point2D::new(2.0, 0.0);
+
+            assert!(edge_or_vertex_crossing_2d(&a, &b, &c, &d));
+        }
+
+        #[test]
+        fn test_edge_or_vertex_crossing_no_cross() {
+            let a = Point2D::new(0.0, 0.0);
+            let b = Point2D::new(1.0, 0.0);
+            let c = Point2D::new(0.0, 1.0);
+            let d = Point2D::new(1.0, 1.0);
+
+            assert!(!edge_or_vertex_crossing_2d(&a, &b, &c, &d));
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // EdgeCrosser2D Tests
+    // -------------------------------------------------------------------------
+
+    mod edge_crosser_tests {
+        use super::*;
+
+        #[test]
+        fn test_edge_crosser_basic() {
+            let a = Point2D::new(0.0, 1.0);
+            let b = Point2D::new(2.0, 1.0);
+
+            let mut crosser = EdgeCrosser2D::new(&a, &b);
+
+            // Edge that crosses AB
+            let c = Point2D::new(1.0, 0.0);
+            let d = Point2D::new(1.0, 2.0);
+            assert_eq!(crosser.crossing_sign(&c, &d), 1);
+
+            // Edge that doesn't cross AB
+            let e = Point2D::new(3.0, 0.0);
+            let f = Point2D::new(3.0, 2.0);
+            assert_eq!(crosser.crossing_sign(&e, &f), -1);
+        }
+
+        #[test]
+        fn test_edge_crosser_chain() {
+            // Test crossing against a chain of edges
+            let a = Point2D::new(0.5, 0.5);
+            let b = Point2D::new(1.5, 0.5);
+
+            // Square from (0,0) to (1,1)
+            let square = [
+                Point2D::new(0.0, 0.0),
+                Point2D::new(1.0, 0.0),
+                Point2D::new(1.0, 1.0),
+                Point2D::new(0.0, 1.0),
+            ];
+
+            let mut crosser = EdgeCrosser2D::new(&a, &b);
+            let mut crossings = 0;
+
+            // Test each edge of the square
+            for i in 0..4 {
+                let v0 = &square[i];
+                let v1 = &square[(i + 1) % 4];
+                if crosser.edge_or_vertex_crossing(v0, v1) {
+                    crossings += 1;
+                }
+            }
+
+            // AB starts at (0.5, 0.5) which is inside the square,
+            // and ends at (1.5, 0.5) which is outside to the right.
+            // The ray only crosses the right edge (x=1), not the left edge.
+            assert_eq!(crossings, 1);
+        }
+
+        #[test]
+        fn test_edge_crosser_consistent_with_standalone() {
+            // EdgeCrosser should give same results as standalone function
+            let a = Point2D::new(0.0, 0.0);
+            let b = Point2D::new(2.0, 2.0);
+            let c = Point2D::new(0.0, 2.0);
+            let d = Point2D::new(2.0, 0.0);
+
+            let mut crosser = EdgeCrosser2D::new(&a, &b);
+            let crosser_result = crosser.edge_or_vertex_crossing(&c, &d);
+            let standalone_result = edge_or_vertex_crossing_2d(&a, &b, &c, &d);
+
+            assert_eq!(crosser_result, standalone_result);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Point-in-Polygon Tests
+    // -------------------------------------------------------------------------
+
+    mod containment_tests {
+        use super::*;
+
+        fn unit_square() -> Vec<Point2D> {
+            vec![
+                Point2D::new(0.0, 0.0),
+                Point2D::new(1.0, 0.0),
+                Point2D::new(1.0, 1.0),
+                Point2D::new(0.0, 1.0),
+            ]
+        }
+
+        #[test]
+        fn test_brute_force_inside() {
+            let square = unit_square();
+            let inside = Point2D::new(0.5, 0.5);
+
+            assert!(brute_force_contains_2d(&inside, &square));
+        }
+
+        #[test]
+        fn test_brute_force_outside() {
+            let square = unit_square();
+            let outside = Point2D::new(2.0, 0.5);
+
+            assert!(!brute_force_contains_2d(&outside, &square));
+        }
+
+        #[test]
+        fn test_brute_force_outside_all_directions() {
+            let square = unit_square();
+
+            // Test points outside in various directions
+            assert!(!brute_force_contains_2d(&Point2D::new(-1.0, 0.5), &square)); // left
+            assert!(!brute_force_contains_2d(&Point2D::new(2.0, 0.5), &square)); // right
+            assert!(!brute_force_contains_2d(&Point2D::new(0.5, -1.0), &square)); // below
+            assert!(!brute_force_contains_2d(&Point2D::new(0.5, 2.0), &square)); // above
+            assert!(!brute_force_contains_2d(&Point2D::new(-1.0, -1.0), &square)); // corner
+        }
+
+        #[test]
+        fn test_brute_force_triangle() {
+            let triangle = vec![
+                Point2D::new(0.0, 0.0),
+                Point2D::new(2.0, 0.0),
+                Point2D::new(1.0, 2.0),
+            ];
+
+            // Center of triangle
+            assert!(brute_force_contains_2d(&Point2D::new(1.0, 0.5), &triangle));
+
+            // Outside
+            assert!(!brute_force_contains_2d(&Point2D::new(0.0, 1.0), &triangle));
+            assert!(!brute_force_contains_2d(&Point2D::new(2.0, 1.0), &triangle));
+        }
+
+        #[test]
+        fn test_compute_origin_inside() {
+            let square = unit_square();
+            let (origin, inside) = compute_origin_inside_2d(&square);
+
+            // Origin should be outside the bounding box
+            assert!(origin.x < 0.0);
+            assert!(origin.y < 0.0);
+
+            // Origin should be outside the polygon
+            assert!(!inside);
+        }
+
+        #[test]
+        fn test_contains_with_origin() {
+            let square = unit_square();
+            let (origin, origin_inside) = compute_origin_inside_2d(&square);
+
+            let inside = Point2D::new(0.5, 0.5);
+            let outside = Point2D::new(2.0, 0.5);
+
+            assert!(contains_with_origin_2d(
+                &inside,
+                &origin,
+                origin_inside,
+                &square
+            ));
+            assert!(!contains_with_origin_2d(
+                &outside,
+                &origin,
+                origin_inside,
+                &square
+            ));
+        }
+
+        #[test]
+        fn test_contains_with_edges() {
+            let square = unit_square();
+            let (origin, origin_inside) = compute_origin_inside_2d(&square);
+
+            let point = Point2D::new(0.5, 0.5);
+
+            // Test with all edges
+            let all_edges: Vec<usize> = (0..4).collect();
+            assert!(contains_with_edges_2d(
+                &point,
+                &origin,
+                origin_inside,
+                &square,
+                &all_edges
+            ));
+
+            // Test with subset of edges (those actually crossed by the test ray)
+            // For a point at (0.5, 0.5) and origin at (-1, -1), the ray
+            // crosses edges 0 (bottom) and 3 (left)
+            let subset = vec![0, 3];
+            assert!(contains_with_edges_2d(
+                &point,
+                &origin,
+                origin_inside,
+                &square,
+                &subset
+            ));
+        }
+
+        #[test]
+        fn test_contains_complex_polygon() {
+            // L-shaped polygon
+            let l_shape = vec![
+                Point2D::new(0.0, 0.0),
+                Point2D::new(2.0, 0.0),
+                Point2D::new(2.0, 1.0),
+                Point2D::new(1.0, 1.0),
+                Point2D::new(1.0, 2.0),
+                Point2D::new(0.0, 2.0),
+            ];
+
+            // Points inside the L
+            assert!(brute_force_contains_2d(&Point2D::new(0.5, 0.5), &l_shape));
+            assert!(brute_force_contains_2d(&Point2D::new(0.5, 1.5), &l_shape));
+            assert!(brute_force_contains_2d(&Point2D::new(1.5, 0.5), &l_shape));
+
+            // Point in the "cutout" of the L
+            assert!(!brute_force_contains_2d(&Point2D::new(1.5, 1.5), &l_shape));
+
+            // Points outside
+            assert!(!brute_force_contains_2d(&Point2D::new(3.0, 0.5), &l_shape));
+            assert!(!brute_force_contains_2d(&Point2D::new(-1.0, 0.5), &l_shape));
+        }
+
+        #[test]
+        fn test_degenerate_cases() {
+            // Empty polygon
+            let empty: Vec<Point2D> = vec![];
+            assert!(!brute_force_contains_2d(&Point2D::new(0.0, 0.0), &empty));
+
+            // Single point
+            let single = vec![Point2D::new(1.0, 1.0)];
+            assert!(!brute_force_contains_2d(&Point2D::new(1.0, 1.0), &single));
+
+            // Line segment (2 points)
+            let line = vec![Point2D::new(0.0, 0.0), Point2D::new(1.0, 1.0)];
+            assert!(!brute_force_contains_2d(&Point2D::new(0.5, 0.5), &line));
+        }
+    }
 }
