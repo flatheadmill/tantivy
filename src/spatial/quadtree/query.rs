@@ -4,9 +4,8 @@ use std::io;
 
 use common::BitSet;
 
-use super::merge::GeometryCache;
 use super::segment::{CellView, QuadtreeSegment, ShapeView};
-use crate::spatial::quadtree::{edge_or_vertex_crossing_2d, Point2D, QuadtreeCellId};
+use crate::spatial::quadtree::{edge_or_vertex_crossing_2d, GeometryCache, Point2D, QuadtreeCellId};
 
 // =============================================================================
 // QuadtreeSegment Query Extensions
