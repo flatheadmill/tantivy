@@ -15,7 +15,7 @@ mod merge;
 mod predicates;
 mod query;
 mod segment;
-mod serialization;
+mod collapse_detector;
 
 pub use builder::{BuilderOptions, QuadtreeIndex, QuadtreeIndexBuilder};
 pub use cell_id::{QuadtreeCellId, MAX_LEVEL};

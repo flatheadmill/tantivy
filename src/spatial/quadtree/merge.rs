@@ -10,9 +10,9 @@
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, VecDeque};
-use std::io::{self, Read, Seek};
+use std::io;
 
-use super::serialization::CollapseDetector;
+use super::collapse_detector::CollapseDetector;
 use crate::spatial::quadtree::{
     Bounds, CacheStats, ClippedShape, GeometryCache, InputIterator, Point2D, QuadtreeCell,
     QuadtreeCellId, Rect,
@@ -552,7 +552,6 @@ mod merge_tests {
     use std::io::Cursor;
 
     use super::*;
-    use crate::spatial::quadtree::serialization::write_cells;
 
     fn test_bounds() -> Bounds {
         Bounds::new(0.0, 0.0, 100.0, 100.0)
@@ -720,7 +719,6 @@ mod merge_tests {
     mod merge_integration_tests {
         use super::*;
         use crate::spatial::quadtree::segment::QuadtreeSegment;
-        use crate::spatial::quadtree::serialization::CellReader;
         use crate::spatial::quadtree::{
             DeleteBitSet, DocIdMap, InMemoryGeometryReader, LruGeometryCache,
         };
@@ -769,33 +767,6 @@ mod merge_tests {
             buf.extend_from_slice(&1u16.to_le_bytes()); // version
             buf.extend_from_slice(&0x5154u16.to_le_bytes()); // magic "QT"
 
-            buf
-        }
-
-        fn create_test_segment(
-            bounds: &Bounds,
-            cells: Vec<(QuadtreeCellId, Vec<(u32, bool, Vec<u16>)>)>,
-        ) -> Cursor<Vec<u8>> {
-            let mut buf = Cursor::new(Vec::new());
-
-            let mut quadtree_cells: Vec<QuadtreeCell> = Vec::new();
-            for (cell_id, shapes_data) in cells {
-                let mut cell = QuadtreeCell::new(cell_id);
-                for (doc_id, contains_center, edges) in shapes_data {
-                    let mut shape = ClippedShape::new(doc_id, contains_center);
-                    for edge in edges {
-                        shape.add_edge(edge);
-                    }
-                    cell.add_shape(shape);
-                }
-                quadtree_cells.push(cell);
-            }
-
-            // Sort by cell_id
-            quadtree_cells.sort_by_key(|c| c.cell_id());
-
-            write_cells(&mut buf, bounds, quadtree_cells).unwrap();
-            buf.set_position(0);
             buf
         }
 
