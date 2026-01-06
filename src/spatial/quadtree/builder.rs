@@ -4,7 +4,11 @@
 //! the architecture of S2's MutableS2ShapeIndex but adapted for planar 2D geometry.
 
 use std::collections::BTreeMap;
+use std::io::{self, Write};
 
+use common::CountingWriter;
+
+use crate::directory::WritePtr;
 use crate::spatial::quadtree::{
     contains_tracker_origin, Bounds, ClippedShape, InteriorTracker, PaddedCell, Point2D,
     QuadtreeCell, QuadtreeCellId, Rect, ShapeIdSet,
@@ -875,6 +879,60 @@ impl QuadtreeIndex {
             let cell_bounds = cell.cell_id().to_bounds(&self.bounds);
             cell_bounds.intersects(&query)
         })
+    }
+
+    /// Serializes the quadtree index.
+    ///
+    /// Format:
+    /// - Cells in cell_id order (variable length)
+    /// - Cell index: (cell_id: u64, offset: u64) pairs
+    /// - Footer (48 bytes): cell_count, cell_index_offset, bounds, version, magic
+    pub fn serialize(&self, write: &mut CountingWriter<WritePtr>) -> io::Result<()> {
+        const VERSION: u16 = 1;
+        const MAGIC: u16 = 0x5154; // "QT"
+
+        let mut index_entries: Vec<(u64, u64)> = Vec::with_capacity(self.cells.len());
+
+        // Write cells in cell_id order
+        for (cell_id, cell) in &self.cells {
+            index_entries.push((cell_id.to_raw(), write.written_bytes()));
+
+            // num_shapes
+            write.write_all(&(cell.num_shapes() as u32).to_le_bytes())?;
+
+            for shape in cell.shapes() {
+                // doc_id
+                write.write_all(&shape.doc_id().to_le_bytes())?;
+                // flags
+                let flags: u8 = if shape.contains_center() { 1 } else { 0 };
+                write.write_all(&[flags])?;
+                // num_edges
+                write.write_all(&(shape.num_edges() as u16).to_le_bytes())?;
+                // edges
+                for &edge in shape.edges() {
+                    write.write_all(&edge.to_le_bytes())?;
+                }
+            }
+        }
+
+        // Write cell index
+        let cell_index_offset = write.written_bytes();
+        for (cell_id, offset) in &index_entries {
+            write.write_all(&cell_id.to_le_bytes())?;
+            write.write_all(&offset.to_le_bytes())?;
+        }
+
+        // Write footer (48 bytes)
+        write.write_all(&(self.cells.len() as u32).to_le_bytes())?;
+        write.write_all(&cell_index_offset.to_le_bytes())?;
+        write.write_all(&self.bounds.min_x.to_le_bytes())?;
+        write.write_all(&self.bounds.min_y.to_le_bytes())?;
+        write.write_all(&self.bounds.max_x.to_le_bytes())?;
+        write.write_all(&self.bounds.max_y.to_le_bytes())?;
+        write.write_all(&VERSION.to_le_bytes())?;
+        write.write_all(&MAGIC.to_le_bytes())?;
+
+        Ok(())
     }
 }
 
