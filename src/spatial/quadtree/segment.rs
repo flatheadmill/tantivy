@@ -99,6 +99,30 @@ impl<'a> QuadtreeSegment<'a> {
         }
         None
     }
+    /// Returns an iterator over all cells in cell_id order.
+    pub fn iter(&'a self) -> CellIterator<'a> {
+        CellIterator {
+            segment: self,
+            index: 0,
+        }
+    }
+
+    pub(crate) fn get_cell_by_index(&self, index: u32) -> Option<CellView<'a>> {
+        if index >= self.cell_count {
+            return None;
+        }
+        let (cell_id, offset) = self.cell_index_entry(index);
+        let next_offset = if index + 1 < self.cell_count {
+            self.cell_index_entry(index + 1).1
+        } else {
+            self.cell_index_offset
+        };
+        let len = (next_offset - offset) as usize;
+        Some(CellView::new(
+            QuadtreeCellId::from_raw(cell_id),
+            &self.data[offset as usize..offset as usize + len],
+        ))
+    }
 }
 
 pub struct CellView<'a> {
@@ -158,6 +182,21 @@ impl<'a> Iterator for ShapeIterator<'a> {
             num_edges,
             edges_data,
         })
+    }
+}
+
+pub struct CellIterator<'a> {
+    segment: &'a QuadtreeSegment<'a>,
+    index: u32,
+}
+
+impl<'a> Iterator for CellIterator<'a> {
+    type Item = CellView<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let cell = self.segment.get_cell_by_index(self.index)?;
+        self.index += 1;
+        Some(cell)
     }
 }
 

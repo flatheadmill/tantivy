@@ -12,8 +12,11 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, VecDeque};
 use std::io::{self, Read, Seek};
 
-use super::serialization::{CollapseDetector};
-use crate::spatial::quadtree::{Bounds, CacheStats, ClippedShape, GeometryCache, InputIterator, Point2D, QuadtreeCell, QuadtreeCellId, Rect};
+use super::serialization::CollapseDetector;
+use crate::spatial::quadtree::{
+    Bounds, CacheStats, ClippedShape, GeometryCache, InputIterator, Point2D, QuadtreeCell,
+    QuadtreeCellId, Rect,
+};
 
 // =============================================================================
 // MergeOptions
@@ -418,14 +421,13 @@ fn edge_crosses_ray(from: &Point2D, to: &Point2D, v0: &Point2D, v1: &Point2D) ->
 /// - An input iterator encounters an I/O error
 /// - The emit callback returns an error
 /// - Geometry lookup fails during split
-pub fn merge<R, G, F>(
-    mut inputs: Vec<InputIterator<R>>,
+pub fn merge<G, F>(
+    mut inputs: Vec<InputIterator>,
     geometry: &mut G,
     options: &MergeOptions,
     mut emit: F,
 ) -> io::Result<MergeStats>
 where
-    R: Read + Seek,
     G: GeometryCache,
     F: FnMut(QuadtreeCell) -> io::Result<()>,
 {
@@ -550,13 +552,11 @@ mod merge_tests {
     use std::io::Cursor;
 
     use super::*;
-    use crate::spatial::quadtree::serialization::{write_cells};
+    use crate::spatial::quadtree::serialization::write_cells;
 
     fn test_bounds() -> Bounds {
         Bounds::new(0.0, 0.0, 100.0, 100.0)
     }
-
-
 
     // -------------------------------------------------------------------------
     // merge_cells Tests
@@ -660,9 +660,8 @@ mod merge_tests {
     // -------------------------------------------------------------------------
 
     mod split_cell_tests {
-        use crate::spatial::quadtree::{InMemoryGeometryReader, LruGeometryCache};
-
         use super::*;
+        use crate::spatial::quadtree::{InMemoryGeometryReader, LruGeometryCache};
 
         fn make_square_geometry() -> InMemoryGeometryReader {
             let mut reader = InMemoryGeometryReader::new();
@@ -719,9 +718,59 @@ mod merge_tests {
     // -------------------------------------------------------------------------
 
     mod merge_integration_tests {
-        use crate::spatial::quadtree::{serialization::CellReader, DeleteBitSet, DocIdMap, InMemoryGeometryReader, LruGeometryCache};
-
         use super::*;
+        use crate::spatial::quadtree::segment::QuadtreeSegment;
+        use crate::spatial::quadtree::serialization::CellReader;
+        use crate::spatial::quadtree::{
+            DeleteBitSet, DocIdMap, InMemoryGeometryReader, LruGeometryCache,
+        };
+
+        fn create_test_segment_bytes(
+            bounds: &Bounds,
+            cells: Vec<(QuadtreeCellId, Vec<(u32, bool, Vec<u16>)>)>,
+        ) -> Vec<u8> {
+            let mut buf = Vec::new();
+            let mut cell_index = Vec::new();
+
+            // Sort cells by cell_id
+            let mut cells = cells;
+            cells.sort_by_key(|(id, _)| id.to_raw());
+
+            // Write cell data, track offsets
+            for (cell_id, shapes) in &cells {
+                let offset = buf.len() as u64;
+                cell_index.push((cell_id.to_raw(), offset));
+
+                buf.extend_from_slice(&(shapes.len() as u32).to_le_bytes());
+                for (doc_id, contains_center, edges) in shapes {
+                    buf.extend_from_slice(&doc_id.to_le_bytes());
+                    buf.push(if *contains_center { 1 } else { 0 });
+                    buf.extend_from_slice(&(edges.len() as u16).to_le_bytes());
+                    for edge in edges {
+                        buf.extend_from_slice(&edge.to_le_bytes());
+                    }
+                }
+            }
+
+            // Write cell index
+            let cell_index_offset = buf.len() as u64;
+            for (cell_id, data_offset) in &cell_index {
+                buf.extend_from_slice(&cell_id.to_le_bytes());
+                buf.extend_from_slice(&data_offset.to_le_bytes());
+            }
+
+            // Write footer
+            buf.extend_from_slice(&(cells.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&cell_index_offset.to_le_bytes());
+            buf.extend_from_slice(&bounds.min_x.to_le_bytes());
+            buf.extend_from_slice(&bounds.min_y.to_le_bytes());
+            buf.extend_from_slice(&bounds.max_x.to_le_bytes());
+            buf.extend_from_slice(&bounds.max_y.to_le_bytes());
+            buf.extend_from_slice(&1u16.to_le_bytes()); // version
+            buf.extend_from_slice(&0x5154u16.to_le_bytes()); // magic "QT"
+
+            buf
+        }
 
         fn create_test_segment(
             bounds: &Bounds,
@@ -755,7 +804,7 @@ mod merge_tests {
             let bounds = test_bounds();
             let options = MergeOptions::new(bounds.clone());
 
-            let inputs: Vec<InputIterator<Cursor<Vec<u8>>>> = Vec::new();
+            let inputs: Vec<InputIterator> = Vec::new();
             let mut reader = InMemoryGeometryReader::new();
             let mut cache = LruGeometryCache::new(reader, 10);
 
@@ -775,10 +824,10 @@ mod merge_tests {
             let bounds = test_bounds();
             let cell_id = QuadtreeCellId::from_xy(50.0, 50.0, 3, &bounds);
 
-            let buf = create_test_segment(&bounds, vec![(cell_id, vec![(1, true, vec![0, 1, 2])])]);
-
-            let reader = CellReader::new(buf).unwrap();
-            let input = InputIterator::unfiltered(reader, 10);
+            let bytes =
+                create_test_segment_bytes(&bounds, vec![(cell_id, vec![(1, true, vec![0, 1, 2])])]);
+            let segment = QuadtreeSegment::new(&bytes).unwrap();
+            let input = InputIterator::unfiltered(&segment, 10);
 
             let mut geom_reader = InMemoryGeometryReader::new();
             let mut cache = LruGeometryCache::new(geom_reader, 10);
@@ -803,13 +852,15 @@ mod merge_tests {
             let cell_id1 = QuadtreeCellId::from_xy(25.0, 25.0, 3, &bounds);
             let cell_id2 = QuadtreeCellId::from_xy(75.0, 75.0, 3, &bounds);
 
-            let buf1 = create_test_segment(&bounds, vec![(cell_id1, vec![(1, true, vec![0])])]);
-            let buf2 = create_test_segment(&bounds, vec![(cell_id2, vec![(2, false, vec![1])])]);
+            let bytes1 =
+                create_test_segment_bytes(&bounds, vec![(cell_id1, vec![(1, true, vec![0])])]);
+            let bytes2 =
+                create_test_segment_bytes(&bounds, vec![(cell_id2, vec![(2, false, vec![1])])]);
 
-            let reader1 = CellReader::new(buf1).unwrap();
-            let reader2 = CellReader::new(buf2).unwrap();
-            let input1 = InputIterator::unfiltered(reader1, 10);
-            let input2 = InputIterator::unfiltered(reader2, 10);
+            let segment1 = QuadtreeSegment::new(&bytes1).unwrap();
+            let segment2 = QuadtreeSegment::new(&bytes2).unwrap();
+            let input1 = InputIterator::unfiltered(&segment1, 10);
+            let input2 = InputIterator::unfiltered(&segment2, 10);
 
             let mut geom_reader = InMemoryGeometryReader::new();
             let mut cache = LruGeometryCache::new(geom_reader, 10);
@@ -834,13 +885,15 @@ mod merge_tests {
             let bounds = test_bounds();
             let cell_id = QuadtreeCellId::from_xy(50.0, 50.0, 3, &bounds);
 
-            let buf1 = create_test_segment(&bounds, vec![(cell_id, vec![(1, false, vec![0, 1])])]);
-            let buf2 = create_test_segment(&bounds, vec![(cell_id, vec![(1, true, vec![2, 3])])]);
+            let bytes1 =
+                create_test_segment_bytes(&bounds, vec![(cell_id, vec![(1, false, vec![0, 1])])]);
+            let bytes2 =
+                create_test_segment_bytes(&bounds, vec![(cell_id, vec![(1, true, vec![2, 3])])]);
 
-            let reader1 = CellReader::new(buf1).unwrap();
-            let reader2 = CellReader::new(buf2).unwrap();
-            let input1 = InputIterator::unfiltered(reader1, 10);
-            let input2 = InputIterator::unfiltered(reader2, 10);
+            let segment1 = QuadtreeSegment::new(&bytes1).unwrap();
+            let segment2 = QuadtreeSegment::new(&bytes2).unwrap();
+            let input1 = InputIterator::unfiltered(&segment1, 10);
+            let input2 = InputIterator::unfiltered(&segment2, 10);
 
             let mut geom_reader = InMemoryGeometryReader::new();
             let mut cache = LruGeometryCache::new(geom_reader, 10);
@@ -867,7 +920,7 @@ mod merge_tests {
             let bounds = test_bounds();
             let cell_id = QuadtreeCellId::from_xy(50.0, 50.0, 3, &bounds);
 
-            let buf = create_test_segment(
+            let bytes = create_test_segment_bytes(
                 &bounds,
                 vec![(
                     cell_id,
@@ -875,14 +928,14 @@ mod merge_tests {
                 )],
             );
 
-            let reader = CellReader::new(buf).unwrap();
+            let segment = QuadtreeSegment::new(&bytes).unwrap();
 
             // Delete doc_id 2
             let mut deletes = DeleteBitSet::new();
             deletes.delete(2);
 
             let doc_id_map = DocIdMap::identity(10);
-            let input = InputIterator::new(reader, deletes, doc_id_map);
+            let input = InputIterator::new(&segment, deletes, doc_id_map);
 
             let mut geom_reader = InMemoryGeometryReader::new();
             let mut cache = LruGeometryCache::new(geom_reader, 10);
@@ -907,16 +960,16 @@ mod merge_tests {
             let bounds = test_bounds();
             let cell_id = QuadtreeCellId::from_xy(50.0, 50.0, 3, &bounds);
 
-            let buf = create_test_segment(
+            let bytes = create_test_segment_bytes(
                 &bounds,
                 vec![(cell_id, vec![(0, true, vec![0]), (1, false, vec![1])])],
             );
 
-            let reader = CellReader::new(buf).unwrap();
+            let segment = QuadtreeSegment::new(&bytes).unwrap();
 
             // Remap: 0 -> 100, 1 -> 101
             let doc_id_map = DocIdMap::with_offset(2, 100);
-            let input = InputIterator::new(reader, DeleteBitSet::new(), doc_id_map);
+            let input = InputIterator::new(&segment, DeleteBitSet::new(), doc_id_map);
 
             let mut geom_reader = InMemoryGeometryReader::new();
             let mut cache = LruGeometryCache::new(geom_reader, 10);

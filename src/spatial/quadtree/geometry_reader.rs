@@ -4,7 +4,8 @@
 // GeometryCache Trait
 // =============================================================================
 
-use std::{collections::HashMap, io};
+use std::collections::HashMap;
+use std::io;
 
 use crate::spatial::quadtree::Point2D;
 
@@ -291,11 +292,9 @@ impl GeometryReader for InMemoryGeometryReader {
 mod tests {
     use super::*;
 
-    /*
-    fn test_bounds() -> Bounds {
-        Bounds::new(0.0, 0.0, 100.0, 100.0)
-    }
-    */
+    // fn test_bounds() -> Bounds {
+    // Bounds::new(0.0, 0.0, 100.0, 100.0)
+    // }
 
     // -------------------------------------------------------------------------
     // CacheStats Tests
