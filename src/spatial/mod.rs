@@ -1,5 +1,7 @@
 //! Spatial module (implements a block kd-tree)
 
+pub mod surface;
+pub mod interior_tracker;
 pub mod bitshuffle;
 pub mod bvh;
 pub mod delta;

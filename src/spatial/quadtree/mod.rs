@@ -6,6 +6,7 @@
 
 mod geometry_server;
 
+mod plane;
 mod builder;
 mod cell_id;
 mod geometry;

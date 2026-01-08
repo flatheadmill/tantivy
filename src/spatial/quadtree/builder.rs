@@ -11,7 +11,7 @@ use common::CountingWriter;
 use crate::directory::WritePtr;
 use crate::spatial::quadtree::{
     contains_tracker_origin, Bounds, ClippedShape, InteriorTracker, PaddedCell, Point2D,
-    QuadtreeCell, QuadtreeCellId, Rect, ShapeIdSet,
+    QuadtreeCell, QuadtreeCellId, Rect,
 };
 
 // =============================================================================
@@ -654,7 +654,7 @@ impl QuadtreeIndexBuilder {
         }
 
         // FIX: Collect shape IDs into a Vec to end the immutable borrow of tracker
-        let containing_shape_ids: Vec<u32> = tracker.shape_ids().iter().collect();
+        let containing_shape_ids: Vec<u32> = tracker.shape_ids().to_vec();
         let num_shapes = self.count_shapes_vec(edges, &containing_shape_ids);
 
         if num_shapes == 0 {
@@ -732,38 +732,6 @@ impl QuadtreeIndexBuilder {
                 );
             }
         }
-    }
-
-    /// Counts the number of distinct shapes in edges plus containing shapes.
-    fn count_shapes(&self, edges: &[ClippedEdge], containing: &ShapeIdSet) -> usize {
-        let mut count = 0;
-        let mut last_shape_id: Option<u32> = None;
-        let mut containing_iter = containing.iter().peekable();
-
-        for edge in edges {
-            let shape_id = edge.face_edge.shape_id;
-
-            if last_shape_id != Some(shape_id) {
-                count += 1;
-                last_shape_id = Some(shape_id);
-
-                // Skip containing shapes up to and including this one
-                while let Some(c_id) = containing_iter.peek().copied() {
-                    if c_id > shape_id {
-                        break;
-                    }
-                    if c_id < shape_id {
-                        count += 1;
-                    }
-                    containing_iter.next();
-                }
-            }
-        }
-
-        // Count remaining containing shapes
-        count += containing_iter.count();
-
-        count
     }
 
     /// Counts the number of distinct shapes in edges plus containing shapes (Vec version).

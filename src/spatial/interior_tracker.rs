@@ -1,67 +1,56 @@
 //! HUSH
 
-use crate::spatial::quadtree::{
-    brute_force_contains_2d, Bounds, EdgeCrosser2D, Point2D, QuadtreeCellId,
-};
+use crate::spatial::surface::Surface;
 
 #[derive(Debug)]
-pub struct InteriorTracker {
-    /// The origin point (start of Z-order curve, outside all shapes).
-    origin: Point2D,
+pub struct InteriorTracker<S: Surface> {
+    origin: S::Point,
 
     /// Previous focus point (start of current DrawTo segment).
-    a: Point2D,
+    a: S::Point,
 
     /// Current focus point.
-    b: Point2D,
+    b: S::Point,
 
     /// The next expected cell ID (for optimization).
     /// When the caller moves to this cell's entry vertex, we can skip MoveTo.
-    next_cellid: QuadtreeCellId,
+    next_cellid: S::CellId,
 
     /// Edge crosser for the current A->B segment.
-    crosser: EdgeCrosser2D,
+    crosser: S::Crosser,
 
     /// Set of shape IDs whose interiors contain the current focus.
     shape_ids: Vec<u32>,
 
     /// Whether any shapes are being tracked.
     is_active: bool,
-
-    /// Saved state for incremental updates.
-    saved_ids: Vec<u32>,
 }
 
-impl InteriorTracker {
-    /// Creates a new InteriorTracker with the origin at the bottom-left corner.
-    ///
-    /// The origin is placed at (bounds.min_x - 1, bounds.min_y - 1) to ensure
-    /// it is outside all shapes indexed within the bounds.
-    pub fn new(bounds: &Bounds) -> Self {
-        let origin = Point2D::new(bounds.min_x - 1.0, bounds.min_y - 1.0);
-        let next_cellid = QuadtreeCellId::begin(QuadtreeCellId::MAX_LEVEL);
+impl<S: Surface> InteriorTracker<S> {
+    pub fn new(surface: &S) -> Self {
+        let origin = surface.origin();
+        let next_cellid = S::cell_begin(S::MAX_LEVEL);
 
         Self {
             origin,
             a: origin,
             b: origin,
             next_cellid,
-            crosser: EdgeCrosser2D::new(&origin, &origin),
+            crosser: S::new_crosser(&origin, &origin),
             shape_ids: Vec::new(),
             is_active: false,
-            saved_ids: Vec::new(),
         }
     }
 
     /// Returns the origin point (start of Z-order curve).
     #[inline]
-    pub fn origin(&self) -> Point2D {
+    pub fn origin(&self) -> S::Point {
         self.origin
     }
 
     /// Returns the current focus point.
     #[inline]
-    pub fn focus(&self) -> Point2D {
+    pub fn focus(&self) -> S::Point {
         self.b
     }
 
@@ -98,7 +87,7 @@ impl InteriorTracker {
     /// Use this when you know there are no edges between the old and new focus.
     /// For example, moving within a cell that has no edges.
     #[inline]
-    pub fn move_to(&mut self, point: &Point2D) {
+    pub fn move_to(&mut self, point: &S::Point) {
         self.b = *point;
     }
 
@@ -106,10 +95,10 @@ impl InteriorTracker {
     ///
     /// After calling this, call `test_edge()` for every edge that might cross
     /// the line segment from the old focus to the new focus.
-    pub fn draw_to(&mut self, point: &Point2D) {
+    pub fn draw_to(&mut self, point: &S::Point) {
         self.a = self.b;
         self.b = *point;
-        self.crosser = EdgeCrosser2D::new(&self.a, &self.b);
+        self.crosser = S::new_crosser(&self.a, &self.b);
     }
 
     /// Tests whether an edge crosses the current DrawTo segment.
@@ -122,10 +111,10 @@ impl InteriorTracker {
     /// * `v0` - First vertex of the edge
     /// * `v1` - Second vertex of the edge
     #[inline]
-    pub fn test_edge(&mut self, shape_id: u32, v0: &Point2D, v1: &Point2D) {
-        if self.crosser.edge_or_vertex_crossing(v0, v1) {
-            self.toggle_shape(shape_id);
-        }
+    pub fn test_edge(&mut self, shape_id: u32, v0: &S::Point, v1: &S::Point) {
+      if S::test_crossing(&mut self.crosser, v0, v1) {
+          self.toggle_shape(shape_id);
+      }
     }
 
     /// Toggles the containment state for a shape.
@@ -133,17 +122,22 @@ impl InteriorTracker {
     /// If the shape is currently in the set, it is removed.
     /// If the shape is not in the set, it is added.
     #[inline]
-    pub fn toggle_shape(&mut self, shape_id: u32) {
-        self.shape_ids.toggle(shape_id);
-    }
+     fn toggle_shape(&mut self, shape_id: u32) {
+      if let Some(pos) = self.shape_ids.iter().position(|&id| id == shape_id) {
+          self.shape_ids.remove(pos);
+      } else {
+          let pos = self.shape_ids.iter().position(|&id| id > shape_id).unwrap_or(self.shape_ids.len());
+          self.shape_ids.insert(pos, shape_id);
+      }
+  }
 
     /// Indicates that the focus is positioned at the entry vertex of the given cell.
     ///
     /// Call this after processing each cell. When traversing in Z-order, the
     /// exit vertex of one cell is often the entry vertex of the next cell,
     /// allowing us to skip the MoveTo call.
-    pub fn set_next_cellid(&mut self, next_cellid: QuadtreeCellId) {
-        self.next_cellid = next_cellid.range_min();
+    pub fn set_next_cellid(&mut self, next_cellid: S::CellId) {
+        self.next_cellid = S::cell_range_min(next_cellid);
     }
 
     /// Returns true if the focus is already at the entry vertex of the given cell.
@@ -151,40 +145,7 @@ impl InteriorTracker {
     /// This optimization avoids redundant DrawTo/TestEdge calls when traversing
     /// cells in Z-order, since adjacent cells often share vertices.
     #[inline]
-    pub fn at_cellid(&self, cellid: QuadtreeCellId) -> bool {
-        cellid.range_min() == self.next_cellid
+    pub fn at_cellid(&self, cellid: S::CellId) -> bool {
+        S::cell_range_min(cellid) == self.next_cellid
     }
-
-    /// Sets the partial shape ID.
-    #[inline]
-    pub fn set_partial_shape_id(&mut self, shape_id: i32) {
-        self.partial_shape_id = shape_id;
-    }
-}
-
-// =============================================================================
-// Helper: Determine Initial Containment at Origin
-// =============================================================================
-
-/// Computes whether a shape's interior contains the tracker's origin point.
-///
-/// This is used when adding a shape to the InteriorTracker. For most shapes,
-/// the origin (bottom-left corner of bounds) will be outside, so this typically
-/// returns false.
-///
-/// # Arguments
-///
-/// * `origin` - The InteriorTracker's origin point
-/// * `vertices` - The shape's vertices in order
-///
-/// # Returns
-///
-/// `true` if the origin is inside the shape's interior
-pub fn contains_tracker_origin(origin: &Point2D, vertices: &[Point2D]) -> bool {
-    if vertices.len() < 3 {
-        return false;
-    }
-
-    // Use brute force contains check
-    brute_force_contains_2d(origin, vertices)
 }
