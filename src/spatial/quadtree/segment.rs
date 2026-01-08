@@ -164,7 +164,7 @@ impl<'a> Iterator for ShapeIterator<'a> {
             return None;
         }
 
-        let doc_id = u32::from_le_bytes(self.data[0..4].try_into().unwrap());
+        let geometry_id = u32::from_le_bytes(self.data[0..4].try_into().unwrap());
         let flags = self.data[4];
         let contains_center = (flags & 1) != 0;
         let num_edges = u16::from_le_bytes(self.data[5..7].try_into().unwrap());
@@ -177,7 +177,7 @@ impl<'a> Iterator for ShapeIterator<'a> {
         self.remaining -= 1;
 
         Some(ShapeView {
-            doc_id,
+            geometry_id,
             contains_center,
             num_edges,
             edges_data,
@@ -201,15 +201,15 @@ impl<'a> Iterator for CellIterator<'a> {
 }
 
 pub struct ShapeView<'a> {
-    doc_id: u32,
+    geometry_id: u32,
     contains_center: bool,
     num_edges: u16,
     edges_data: &'a [u8],
 }
 
 impl<'a> ShapeView<'a> {
-    pub fn doc_id(&self) -> u32 {
-        self.doc_id
+    pub fn geometry_id(&self) -> u32 {
+        self.geometry_id
     }
     pub fn contains_center(&self) -> bool {
         self.contains_center

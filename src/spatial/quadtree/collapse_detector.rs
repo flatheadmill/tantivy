@@ -1,4 +1,8 @@
-use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Write};
+
+use std::collections::HashMap;
+
+use crate::spatial::quadtree::{QuadtreeCell, QuadtreeCellId};
 
 
 
@@ -74,10 +78,6 @@ impl CollapseCandidate {
 // =============================================================================
 // Collapse Detector
 // =============================================================================
-
-use std::collections::HashMap;
-
-use crate::spatial::quadtree::{Bounds, ClippedShape, QuadtreeCell, QuadtreeCellId};
 
 /// Detects cells that are candidates for collapse during merge.
 ///

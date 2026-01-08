@@ -28,7 +28,7 @@ use crate::spatial::quadtree::{
 #[derive(Debug, Clone)]
 pub struct ClippedShape {
     /// Document ID (shape identifier within the segment).
-    doc_id: u32,
+    geometry_id: u32,
 
     /// Whether the shape's interior contains the cell center.
     ///
@@ -50,12 +50,12 @@ impl ClippedShape {
     ///
     /// # Arguments
     ///
-    /// * `doc_id` - The document ID of the shape
+    /// * `geometry_id` - The document ID of the shape
     /// * `contains_center` - Whether the shape interior contains the cell center
     #[inline]
-    pub fn new(doc_id: u32, contains_center: bool) -> Self {
+    pub fn new(geometry_id: u32, contains_center: bool) -> Self {
         Self {
-            doc_id,
+            geometry_id,
             contains_center,
             edges: SmallVec::new(),
         }
@@ -63,9 +63,9 @@ impl ClippedShape {
 
     /// Creates a ClippedShape with preallocated edge capacity.
     #[inline]
-    pub fn with_capacity(doc_id: u32, contains_center: bool, capacity: usize) -> Self {
+    pub fn with_capacity(geometry_id: u32, contains_center: bool, capacity: usize) -> Self {
         Self {
-            doc_id,
+            geometry_id,
             contains_center,
             edges: SmallVec::with_capacity(capacity),
         }
@@ -73,8 +73,8 @@ impl ClippedShape {
 
     /// Returns the document ID.
     #[inline]
-    pub fn doc_id(&self) -> u32 {
-        self.doc_id
+    pub fn geometry_id(&self) -> u32 {
+        self.geometry_id
     }
 
     /// Returns whether the shape's interior contains the cell center.
@@ -167,7 +167,7 @@ impl ClippedShape {
         self.edges.is_empty()
     }
 
-    /// Clears all edge indices, keeping doc_id and contains_center.
+    /// Clears all edge indices, keeping geometry_id and contains_center.
     #[inline]
     pub fn clear_edges(&mut self) {
         self.edges.clear();
@@ -176,7 +176,7 @@ impl ClippedShape {
 
 impl PartialEq for ClippedShape {
     fn eq(&self, other: &Self) -> bool {
-        self.doc_id == other.doc_id
+        self.geometry_id == other.geometry_id
             && self.contains_center == other.contains_center
             && self.edges == other.edges
     }
@@ -191,13 +191,13 @@ impl Eq for ClippedShape {}
 /// A single cell in the quadtree index.
 ///
 /// Each cell contains a set of ClippedShapes representing the shapes that
-/// intersect this cell. Shapes are stored sorted by doc_id for efficient
+/// intersect this cell. Shapes are stored sorted by geometry_id for efficient
 /// lookup and merging.
 ///
 /// # Cell Properties
 ///
 /// - `cell_id`: Identifies the cell's position and level in the quadtree
-/// - `shapes`: Shapes intersecting this cell, sorted by doc_id
+/// - `shapes`: Shapes intersecting this cell, sorted by geometry_id
 ///
 /// # Query Usage
 ///
@@ -210,7 +210,7 @@ pub struct QuadtreeCell {
     /// The cell ID (encodes position and level).
     cell_id: QuadtreeCellId,
 
-    /// Shapes intersecting this cell, sorted by doc_id.
+    /// Shapes intersecting this cell, sorted by geometry_id.
     shapes: Vec<ClippedShape>,
 }
 
@@ -267,58 +267,58 @@ impl QuadtreeCell {
         &self.shapes[i]
     }
 
-    /// Finds the ClippedShape for the given doc_id.
+    /// Finds the ClippedShape for the given geometry_id.
     ///
-    /// Returns `None` if no shape with that doc_id is in this cell.
+    /// Returns `None` if no shape with that geometry_id is in this cell.
     /// Uses binary search for O(log n) lookup.
-    pub fn find_shape(&self, doc_id: u32) -> Option<&ClippedShape> {
+    pub fn find_shape(&self, geometry_id: u32) -> Option<&ClippedShape> {
         self.shapes
-            .binary_search_by_key(&doc_id, |s| s.doc_id)
+            .binary_search_by_key(&geometry_id, |s| s.geometry_id)
             .ok()
             .map(|idx| &self.shapes[idx])
     }
 
-    /// Finds the mutable ClippedShape for the given doc_id.
-    pub fn find_shape_mut(&mut self, doc_id: u32) -> Option<&mut ClippedShape> {
+    /// Finds the mutable ClippedShape for the given geometry_id.
+    pub fn find_shape_mut(&mut self, geometry_id: u32) -> Option<&mut ClippedShape> {
         self.shapes
-            .binary_search_by_key(&doc_id, |s| s.doc_id)
+            .binary_search_by_key(&geometry_id, |s| s.geometry_id)
             .ok()
             .map(|idx| &mut self.shapes[idx])
     }
 
-    /// Adds a shape to the cell, maintaining sorted order by doc_id.
+    /// Adds a shape to the cell, maintaining sorted order by geometry_id.
     ///
-    /// If a shape with the same doc_id already exists, it is replaced.
+    /// If a shape with the same geometry_id already exists, it is replaced.
     pub fn add_shape(&mut self, shape: ClippedShape) {
         match self
             .shapes
-            .binary_search_by_key(&shape.doc_id, |s| s.doc_id)
+            .binary_search_by_key(&shape.geometry_id, |s| s.geometry_id)
         {
             Ok(idx) => self.shapes[idx] = shape,        // Replace existing
             Err(idx) => self.shapes.insert(idx, shape), // Insert at sorted position
         }
     }
 
-    /// Gets or creates a ClippedShape for the given doc_id.
+    /// Gets or creates a ClippedShape for the given geometry_id.
     ///
     /// If no shape exists, creates one with `contains_center = false`
     /// and no edges.
-    pub fn get_or_create_shape(&mut self, doc_id: u32) -> &mut ClippedShape {
-        match self.shapes.binary_search_by_key(&doc_id, |s| s.doc_id) {
+    pub fn get_or_create_shape(&mut self, geometry_id: u32) -> &mut ClippedShape {
+        match self.shapes.binary_search_by_key(&geometry_id, |s| s.geometry_id) {
             Ok(idx) => &mut self.shapes[idx],
             Err(idx) => {
-                self.shapes.insert(idx, ClippedShape::new(doc_id, false));
+                self.shapes.insert(idx, ClippedShape::new(geometry_id, false));
                 &mut self.shapes[idx]
             }
         }
     }
 
-    /// Removes the shape with the given doc_id.
+    /// Removes the shape with the given geometry_id.
     ///
     /// Returns the removed shape, or `None` if not found.
-    pub fn remove_shape(&mut self, doc_id: u32) -> Option<ClippedShape> {
+    pub fn remove_shape(&mut self, geometry_id: u32) -> Option<ClippedShape> {
         self.shapes
-            .binary_search_by_key(&doc_id, |s| s.doc_id)
+            .binary_search_by_key(&geometry_id, |s| s.geometry_id)
             .ok()
             .map(|idx| self.shapes.remove(idx))
     }
@@ -340,16 +340,16 @@ impl QuadtreeCell {
         self.shapes.clear();
     }
 
-    /// Returns an iterator over (doc_id, contains_center) pairs.
+    /// Returns an iterator over (geometry_id, contains_center) pairs.
     pub fn doc_ids(&self) -> impl Iterator<Item = (u32, bool)> + '_ {
-        self.shapes.iter().map(|s| (s.doc_id, s.contains_center))
+        self.shapes.iter().map(|s| (s.geometry_id, s.contains_center))
     }
 
-    /// Sorts shapes by doc_id (call after bulk insertion).
+    /// Sorts shapes by geometry_id (call after bulk insertion).
     ///
     /// This is useful when shapes were added without maintaining sort order.
     pub fn sort_shapes(&mut self) {
-        self.shapes.sort_by_key(|s| s.doc_id);
+        self.shapes.sort_by_key(|s| s.geometry_id);
     }
 }
 
@@ -717,7 +717,7 @@ mod index_structure_tests {
         #[test]
         fn test_new() {
             let shape = ClippedShape::new(42, true);
-            assert_eq!(shape.doc_id(), 42);
+            assert_eq!(shape.geometry_id(), 42);
             assert!(shape.contains_center());
             assert_eq!(shape.num_edges(), 0);
             assert!(shape.is_empty());
@@ -726,7 +726,7 @@ mod index_structure_tests {
         #[test]
         fn test_with_capacity() {
             let shape = ClippedShape::with_capacity(10, false, 8);
-            assert_eq!(shape.doc_id(), 10);
+            assert_eq!(shape.geometry_id(), 10);
             assert!(!shape.contains_center());
             assert_eq!(shape.num_edges(), 0);
         }
@@ -865,7 +865,7 @@ mod index_structure_tests {
 
             assert_eq!(cell.num_shapes(), 4);
 
-            let doc_ids: Vec<u32> = cell.shapes().iter().map(|s| s.doc_id()).collect();
+            let doc_ids: Vec<u32> = cell.shapes().iter().map(|s| s.geometry_id()).collect();
             assert_eq!(doc_ids, vec![10, 20, 30, 50]);
         }
 
@@ -880,7 +880,7 @@ mod index_structure_tests {
             assert_eq!(cell.num_shapes(), 1);
             assert!(!cell.shapes()[0].contains_center());
 
-            // Replace with new shape having same doc_id
+            // Replace with new shape having same geometry_id
             let mut shape2 = ClippedShape::new(10, true);
             shape2.add_edge(2);
             cell.add_shape(shape2);
@@ -900,7 +900,7 @@ mod index_structure_tests {
 
             let found = cell.find_shape(20);
             assert!(found.is_some());
-            assert_eq!(found.unwrap().doc_id(), 20);
+            assert_eq!(found.unwrap().geometry_id(), 20);
             assert!(!found.unwrap().contains_center());
 
             assert!(cell.find_shape(15).is_none());
@@ -913,7 +913,7 @@ mod index_structure_tests {
 
             // Create new
             let shape = cell.get_or_create_shape(10);
-            assert_eq!(shape.doc_id(), 10);
+            assert_eq!(shape.geometry_id(), 10);
             assert!(!shape.contains_center());
             shape.set_contains_center(true);
 
@@ -934,7 +934,7 @@ mod index_structure_tests {
 
             let removed = cell.remove_shape(20);
             assert!(removed.is_some());
-            assert_eq!(removed.unwrap().doc_id(), 20);
+            assert_eq!(removed.unwrap().geometry_id(), 20);
 
             assert_eq!(cell.num_shapes(), 2);
             assert!(cell.find_shape(20).is_none());

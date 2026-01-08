@@ -4,6 +4,8 @@
 //! architecture of Google S2's MutableS2ShapeIndex but adapted for planar geometry instead of
 //! unit-sphere geometry.
 
+mod geometry_server;
+
 mod builder;
 mod cell_id;
 mod geometry;

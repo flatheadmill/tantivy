@@ -58,7 +58,7 @@ pub trait GeometryCache {
     ///
     /// Returns an error if the geometry cannot be read (I/O error,
     /// missing document, corrupt data).
-    fn get(&mut self, doc_id: u32) -> io::Result<&[Point2D]>;
+    fn get(&mut self, geometry_id: u32) -> io::Result<&[Point2D]>;
 
     /// Prefetch hint for upcoming document IDs.
     ///
@@ -87,7 +87,7 @@ pub trait GeometryReader {
     /// Reads the geometry for the given document ID.
     ///
     /// Returns the vertices as a new Vec.
-    fn read_geometry(&mut self, doc_id: u32) -> io::Result<Vec<Point2D>>;
+    fn read_geometry(&mut self, geometry_id: u32) -> io::Result<Vec<Point2D>>;
 }
 
 // =============================================================================
@@ -97,17 +97,17 @@ pub trait GeometryReader {
 /// An LRU cache for geometries backed by a GeometryReader.
 ///
 /// Uses a simple Vec + HashMap implementation for LRU behavior:
-/// - HashMap maps doc_id to index in the entries vector
+/// - HashMap maps geometry_id to index in the entries vector
 /// - Entries are ordered by access time (most recent at end)
 /// - When at capacity, the least recently used entry is evicted
 pub struct LruGeometryCache<R: GeometryReader> {
     /// Underlying reader for cache misses.
     reader: R,
 
-    /// Cached geometries: (doc_id, vertices).
+    /// Cached geometries: (geometry_id, vertices).
     entries: Vec<(u32, Vec<Point2D>)>,
 
-    /// Maps doc_id to index in entries for O(1) lookup.
+    /// Maps geometry_id to index in entries for O(1) lookup.
     index: HashMap<u32, usize>,
 
     /// Maximum number of cached geometries.
@@ -162,7 +162,7 @@ impl<R: GeometryReader> LruGeometryCache<R> {
         }
 
         let entry = self.entries.remove(idx);
-        let doc_id = entry.0;
+        let geometry_id = entry.0;
 
         // Update indices for shifted entries
         for i in idx..self.entries.len() {
@@ -172,7 +172,7 @@ impl<R: GeometryReader> LruGeometryCache<R> {
         }
 
         // Add to end
-        self.index.insert(doc_id, self.entries.len());
+        self.index.insert(geometry_id, self.entries.len());
         self.entries.push(entry);
     }
 
@@ -182,8 +182,8 @@ impl<R: GeometryReader> LruGeometryCache<R> {
             return;
         }
 
-        let (doc_id, _) = self.entries.remove(0);
-        self.index.remove(&doc_id);
+        let (geometry_id, _) = self.entries.remove(0);
+        self.index.remove(&geometry_id);
         self.stats.evictions += 1;
 
         // Update indices for shifted entries
@@ -194,9 +194,9 @@ impl<R: GeometryReader> LruGeometryCache<R> {
 }
 
 impl<R: GeometryReader> GeometryCache for LruGeometryCache<R> {
-    fn get(&mut self, doc_id: u32) -> io::Result<&[Point2D]> {
+    fn get(&mut self, geometry_id: u32) -> io::Result<&[Point2D]> {
         // Check if already cached
-        if let Some(&idx) = self.index.get(&doc_id) {
+        if let Some(&idx) = self.index.get(&geometry_id) {
             self.stats.hits += 1;
             self.touch(idx);
             // After touch, it's at the end
@@ -211,22 +211,22 @@ impl<R: GeometryReader> GeometryCache for LruGeometryCache<R> {
         }
 
         // Load from reader
-        let vertices = self.reader.read_geometry(doc_id)?;
+        let vertices = self.reader.read_geometry(geometry_id)?;
         self.stats.bytes_read += (vertices.len() * std::mem::size_of::<Point2D>()) as u64;
 
         // Insert at end (most recently used)
         let new_idx = self.entries.len();
-        self.entries.push((doc_id, vertices));
-        self.index.insert(doc_id, new_idx);
+        self.entries.push((geometry_id, vertices));
+        self.index.insert(geometry_id, new_idx);
 
         Ok(&self.entries.last().unwrap().1)
     }
 
     fn prefetch(&mut self, doc_ids: &[u32]) {
         // Simple synchronous prefetch - just warm the cache
-        for &doc_id in doc_ids {
-            if !self.index.contains_key(&doc_id) {
-                let _ = self.get(doc_id); // Ignore errors in prefetch
+        for &geometry_id in doc_ids {
+            if !self.index.contains_key(&geometry_id) {
+                let _ = self.get(geometry_id); // Ignore errors in prefetch
             }
         }
     }
@@ -256,8 +256,8 @@ impl InMemoryGeometryReader {
     }
 
     /// Adds a geometry for the given document ID.
-    pub fn add(&mut self, doc_id: u32, vertices: Vec<Point2D>) {
-        self.geometries.insert(doc_id, vertices);
+    pub fn add(&mut self, geometry_id: u32, vertices: Vec<Point2D>) {
+        self.geometries.insert(geometry_id, vertices);
     }
 
     /// Returns the number of stored geometries.
@@ -278,11 +278,11 @@ impl Default for InMemoryGeometryReader {
 }
 
 impl GeometryReader for InMemoryGeometryReader {
-    fn read_geometry(&mut self, doc_id: u32) -> io::Result<Vec<Point2D>> {
-        self.geometries.get(&doc_id).cloned().ok_or_else(|| {
+    fn read_geometry(&mut self, geometry_id: u32) -> io::Result<Vec<Point2D>> {
+        self.geometries.get(&geometry_id).cloned().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("geometry not found for doc_id {}", doc_id),
+                format!("geometry not found for geometry_id {}", geometry_id),
             )
         })
     }

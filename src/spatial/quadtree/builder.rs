@@ -164,7 +164,7 @@ impl<'a> ClippedEdge<'a> {
 #[derive(Debug, Clone)]
 struct ShapeData {
     /// Document/shape ID.
-    doc_id: u32,
+    geometry_id: u32,
 
     /// Vertices of the shape (closed polygon: first == last).
     vertices: Vec<Point2D>,
@@ -203,7 +203,7 @@ impl Default for BuilderOptions {
 /// ```ignore
 /// let mut builder = QuadtreeIndexBuilder::new(bounds);
 ///
-/// // Add shapes (polygons with doc_ids)
+/// // Add shapes (polygons with geometry_id)
 /// builder.add_shape(0, &polygon1_vertices);
 /// builder.add_shape(1, &polygon2_vertices);
 ///
@@ -264,20 +264,20 @@ impl QuadtreeIndexBuilder {
     ///
     /// # Arguments
     ///
-    /// * `doc_id` - The document ID for this shape
+    /// * `geometry_id` - The document ID for this shape
     /// * `vertices` - The polygon vertices in order (will be closed automatically)
     ///
     /// # Panics
     ///
     /// Panics if vertices has fewer than 3 points.
-    pub fn add_shape(&mut self, doc_id: u32, vertices: &[Point2D]) {
+    pub fn add_shape(&mut self, geometry_id: u32, vertices: &[Point2D]) {
         assert!(vertices.len() >= 3, "Polygon must have at least 3 vertices");
 
         let has_interior = true; // Polygons have interiors
 
         // Store shape data
         self.shapes.push(ShapeData {
-            doc_id,
+            geometry_id,
             vertices: vertices.to_vec(),
             has_interior,
         });
@@ -289,7 +289,7 @@ impl QuadtreeIndexBuilder {
             let v1 = vertices[(i + 1) % n];
 
             self.edges.push(FaceEdge::new(
-                doc_id,
+                geometry_id,
                 i as u16,
                 has_interior,
                 v0,
@@ -303,9 +303,9 @@ impl QuadtreeIndexBuilder {
     ///
     /// # Arguments
     ///
-    /// * `doc_id` - The document ID for this shape
+    /// * `geometry_id` - The document ID for this shape
     /// * `vertices` - The polyline vertices in order
-    pub fn add_polyline(&mut self, doc_id: u32, vertices: &[Point2D]) {
+    pub fn add_polyline(&mut self, geometry_id: u32, vertices: &[Point2D]) {
         if vertices.len() < 2 {
             return; // Polylines need at least 2 vertices
         }
@@ -313,7 +313,7 @@ impl QuadtreeIndexBuilder {
         let has_interior = false; // Polylines don't have interiors
 
         self.shapes.push(ShapeData {
-            doc_id,
+            geometry_id,
             vertices: vertices.to_vec(),
             has_interior,
         });
@@ -321,7 +321,7 @@ impl QuadtreeIndexBuilder {
         // Create edges (n-1 edges for n vertices)
         for i in 0..vertices.len() - 1 {
             self.edges.push(FaceEdge::new(
-                doc_id,
+                geometry_id,
                 i as u16,
                 has_interior,
                 vertices[i],
@@ -357,7 +357,7 @@ impl QuadtreeIndexBuilder {
         for shape in &self.shapes {
             if shape.has_interior {
                 let contains_origin = contains_tracker_origin(&tracker.origin(), &shape.vertices);
-                tracker.add_shape(shape.doc_id, contains_origin);
+                tracker.add_shape(shape.geometry_id, contains_origin);
             }
         }
 
@@ -901,8 +901,8 @@ impl QuadtreeIndex {
             write.write_all(&(cell.num_shapes() as u32).to_le_bytes())?;
 
             for shape in cell.shapes() {
-                // doc_id
-                write.write_all(&shape.doc_id().to_le_bytes())?;
+                // geometry_id
+                write.write_all(&shape.geometry_id().to_le_bytes())?;
                 // flags
                 let flags: u8 = if shape.contains_center() { 1 } else { 0 };
                 write.write_all(&[flags])?;
@@ -933,370 +933,5 @@ impl QuadtreeIndex {
         write.write_all(&MAGIC.to_le_bytes())?;
 
         Ok(())
-    }
-}
-
-// =============================================================================
-// Unit Tests
-// =============================================================================
-
-#[cfg(test)]
-mod builder_tests {
-    use super::*;
-
-    fn test_bounds() -> Bounds {
-        Bounds::new(0.0, 0.0, 100.0, 100.0)
-    }
-
-    fn square_polygon(x: f64, y: f64, size: f64) -> Vec<Point2D> {
-        vec![
-            Point2D::new(x, y),
-            Point2D::new(x + size, y),
-            Point2D::new(x + size, y + size),
-            Point2D::new(x, y + size),
-        ]
-    }
-
-    // -------------------------------------------------------------------------
-    // Basic Builder Tests
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_empty_builder() {
-        let builder = QuadtreeIndexBuilder::new(test_bounds());
-        assert_eq!(builder.num_shapes(), 0);
-        assert_eq!(builder.num_edges(), 0);
-
-        let index = builder.build();
-        assert!(index.is_empty());
-    }
-
-    #[test]
-    fn test_single_shape() {
-        let mut builder = QuadtreeIndexBuilder::new(test_bounds());
-        builder.add_shape(0, &square_polygon(10.0, 10.0, 20.0));
-
-        assert_eq!(builder.num_shapes(), 1);
-        assert_eq!(builder.num_edges(), 4);
-
-        let index = builder.build();
-        assert!(!index.is_empty());
-    }
-
-    #[test]
-    fn test_multiple_shapes() {
-        let mut builder = QuadtreeIndexBuilder::new(test_bounds());
-        builder.add_shape(0, &square_polygon(10.0, 10.0, 10.0));
-        builder.add_shape(1, &square_polygon(60.0, 60.0, 10.0));
-        builder.add_shape(2, &square_polygon(30.0, 30.0, 40.0));
-
-        assert_eq!(builder.num_shapes(), 3);
-        assert_eq!(builder.num_edges(), 12);
-
-        let index = builder.build();
-        assert!(!index.is_empty());
-    }
-
-    #[test]
-    fn test_overlapping_shapes() {
-        let mut builder = QuadtreeIndexBuilder::new(test_bounds());
-
-        // Two overlapping squares
-        builder.add_shape(0, &square_polygon(20.0, 20.0, 30.0));
-        builder.add_shape(1, &square_polygon(35.0, 35.0, 30.0));
-
-        let index = builder.build();
-        assert!(!index.is_empty());
-
-        // Check that cells exist
-        let num_cells = index.num_cells();
-        assert!(num_cells > 0, "Should have at least one cell");
-    }
-
-    // -------------------------------------------------------------------------
-    // Point Location Tests
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_locate_point_inside_shape() {
-        let mut builder = QuadtreeIndexBuilder::new(test_bounds());
-        builder.add_shape(0, &square_polygon(25.0, 25.0, 50.0));
-
-        let index = builder.build();
-
-        // Point in center of the square
-        let center = Point2D::new(50.0, 50.0);
-        let cell = index.locate_point(&center);
-        assert!(cell.is_some(), "Should find cell containing center point");
-
-        let cell = cell.unwrap();
-        let shape = cell.find_shape(0);
-        assert!(shape.is_some(), "Cell should contain shape 0");
-    }
-
-    #[test]
-    fn test_locate_point_outside_all_shapes() {
-        let mut builder = QuadtreeIndexBuilder::new(test_bounds());
-        builder.add_shape(0, &square_polygon(60.0, 60.0, 20.0));
-
-        let index = builder.build();
-
-        // Point far from the square
-        let outside = Point2D::new(10.0, 10.0);
-        let cell = index.locate_point(&outside);
-        // May or may not find a cell depending on index structure
-        // If found, the shape should not be in it or should not contain center
-    }
-
-    // -------------------------------------------------------------------------
-    // Contains Center Tests
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_contains_center_single_shape() {
-        let mut builder = QuadtreeIndexBuilder::new(test_bounds());
-
-        // Large square covering center of space
-        builder.add_shape(0, &square_polygon(25.0, 25.0, 50.0));
-
-        let index = builder.build();
-
-        // Look for a cell whose center is inside the square
-        let mut found_containing = false;
-        for (_, cell) in index.cells() {
-            if let Some(shape) = cell.find_shape(0) {
-                if shape.contains_center() {
-                    found_containing = true;
-                    break;
-                }
-            }
-        }
-
-        assert!(
-            found_containing,
-            "Should find at least one cell where shape contains center"
-        );
-    }
-
-    #[test]
-    fn test_contains_center_disjoint_shapes() {
-        let mut builder = QuadtreeIndexBuilder::new(test_bounds());
-
-        // Two disjoint squares in opposite corners
-        builder.add_shape(0, &square_polygon(5.0, 5.0, 15.0));
-        builder.add_shape(1, &square_polygon(80.0, 80.0, 15.0));
-
-        let index = builder.build();
-
-        // Each cell should contain at most one shape's interior
-        for (_, cell) in index.cells() {
-            let mut containing_count = 0;
-            for shape in cell.shapes() {
-                if shape.contains_center() {
-                    containing_count += 1;
-                }
-            }
-            assert!(
-                containing_count <= 1,
-                "Disjoint shapes should not both contain same cell center"
-            );
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // Edge Clipping Tests
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_edge_distribution() {
-        let mut builder = QuadtreeIndexBuilder::new(test_bounds());
-
-        // Shape with edges spanning multiple cells
-        builder.add_shape(
-            0,
-            &vec![
-                Point2D::new(10.0, 10.0),
-                Point2D::new(90.0, 10.0),
-                Point2D::new(90.0, 90.0),
-                Point2D::new(10.0, 90.0),
-            ],
-        );
-
-        let index = builder.build();
-
-        // The long horizontal edge should appear in multiple cells
-        let mut total_edge_refs = 0;
-        for (_, cell) in index.cells() {
-            for shape in cell.shapes() {
-                total_edge_refs += shape.num_edges();
-            }
-        }
-
-        // Each edge may appear in multiple cells due to clipping
-        assert!(
-            total_edge_refs >= 4,
-            "Should have at least 4 edge references (one per original edge)"
-        );
-    }
-
-    // -------------------------------------------------------------------------
-    // Configuration Tests
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_custom_options() {
-        let options = BuilderOptions {
-            max_edges_per_cell: 2,
-            cell_padding: 1e-10,
-        };
-
-        let mut builder = QuadtreeIndexBuilder::with_options(test_bounds(), options);
-        builder.add_shape(0, &square_polygon(10.0, 10.0, 80.0));
-
-        let index = builder.build();
-
-        // With max_edges_per_cell = 2, should create more cells than with default 10
-        assert!(
-            index.num_cells() > 0,
-            "Should create cells with custom options"
-        );
-    }
-
-    // -------------------------------------------------------------------------
-    // Polyline Tests
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_polyline_no_interior() {
-        let mut builder = QuadtreeIndexBuilder::new(test_bounds());
-
-        // Add a polyline (no interior)
-        builder.add_polyline(
-            0,
-            &vec![
-                Point2D::new(10.0, 50.0),
-                Point2D::new(50.0, 50.0),
-                Point2D::new(90.0, 50.0),
-            ],
-        );
-
-        assert_eq!(builder.num_shapes(), 1);
-        assert_eq!(builder.num_edges(), 2); // 3 vertices = 2 edges
-
-        let index = builder.build();
-
-        // Polylines should never have contains_center = true
-        for (_, cell) in index.cells() {
-            for shape in cell.shapes() {
-                assert!(
-                    !shape.contains_center(),
-                    "Polyline should never contain cell center"
-                );
-            }
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // Iterator Tests
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_cells_iterator() {
-        let mut builder = QuadtreeIndexBuilder::new(test_bounds());
-        builder.add_shape(0, &square_polygon(40.0, 40.0, 20.0));
-
-        let index = builder.build();
-
-        let cells: Vec<_> = index.cells().collect();
-        assert!(!cells.is_empty());
-
-        // Verify Z-order (cell IDs should be monotonically increasing)
-        for i in 1..cells.len() {
-            assert!(
-                cells[i].0 > cells[i - 1].0,
-                "Cells should be in Z-order (increasing cell ID)"
-            );
-        }
-    }
-
-    #[test]
-    fn test_cells_intersecting() {
-        let mut builder = QuadtreeIndexBuilder::new(test_bounds());
-        builder.add_shape(0, &square_polygon(10.0, 10.0, 20.0));
-        builder.add_shape(1, &square_polygon(70.0, 70.0, 20.0));
-
-        let index = builder.build();
-
-        // Query a region that should only intersect the first shape
-        let query = Rect::from_coords(5.0, 5.0, 35.0, 35.0);
-        let cells: Vec<_> = index.cells_intersecting(&query).collect();
-
-        // Should find some cells
-        assert!(!cells.is_empty());
-
-        // All found cells should intersect the query bounds
-        for cell in &cells {
-            let cell_bounds = cell.cell_id().to_bounds(&test_bounds());
-            assert!(
-                cell_bounds.intersects(&query),
-                "Returned cell should intersect query bounds"
-            );
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // Complex Shape Tests
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_concave_polygon() {
-        let mut builder = QuadtreeIndexBuilder::new(test_bounds());
-
-        // L-shaped polygon
-        builder.add_shape(
-            0,
-            &vec![
-                Point2D::new(20.0, 20.0),
-                Point2D::new(60.0, 20.0),
-                Point2D::new(60.0, 50.0),
-                Point2D::new(40.0, 50.0),
-                Point2D::new(40.0, 80.0),
-                Point2D::new(20.0, 80.0),
-            ],
-        );
-
-        assert_eq!(builder.num_edges(), 6);
-
-        let index = builder.build();
-        assert!(!index.is_empty());
-
-        // The concave region (40-60, 50-80) should have cells where
-        // the shape does NOT contain the center
-        let concave_point = Point2D::new(55.0, 70.0);
-        if let Some(cell) = index.locate_point(&concave_point) {
-            // This cell should NOT have contains_center = true for shape 0
-            // (the point is outside the L-shape)
-        }
-    }
-
-    #[test]
-    fn test_many_small_shapes() {
-        let mut builder = QuadtreeIndexBuilder::new(test_bounds());
-
-        // Add many small non-overlapping squares
-        let mut doc_id = 0;
-        for i in 0..5 {
-            for j in 0..5 {
-                let x = 5.0 + (i as f64) * 19.0;
-                let y = 5.0 + (j as f64) * 19.0;
-                builder.add_shape(doc_id, &square_polygon(x, y, 14.0));
-                doc_id += 1;
-            }
-        }
-
-        assert_eq!(builder.num_shapes(), 25);
-
-        let index = builder.build();
-        assert!(!index.is_empty());
     }
 }

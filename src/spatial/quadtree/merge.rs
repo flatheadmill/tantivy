@@ -105,7 +105,7 @@ struct MergeHeapEntry {
     cell_id: QuadtreeCellId,
 
     /// Index of the input iterator.
-    input_idx: usize,
+    index: usize,
 }
 
 impl Eq for MergeHeapEntry {}
@@ -425,7 +425,7 @@ pub fn merge<G, F>(
     mut inputs: Vec<InputIterator>,
     geometry: &mut G,
     options: &MergeOptions,
-    mut emit: F,
+    mut emit_cell: F,
 ) -> io::Result<MergeStats>
 where
     G: GeometryCache,
@@ -439,59 +439,53 @@ where
 
     // Initialize heap with first cell from each input
     let mut heap = BinaryHeap::new();
-    for (idx, input) in inputs.iter().enumerate() {
+    for (index, input) in inputs.iter().enumerate() {
         if let Some(cell_id) = input.current_cell_id() {
             stats.cells_input += 1;
-            heap.push(MergeHeapEntry {
-                cell_id,
-                input_idx: idx,
-            });
+            heap.push(MergeHeapEntry { cell_id, index });
         }
     }
 
     while let Some(entry) = heap.pop() {
         let cell_id = entry.cell_id;
 
-        // Emit pending cells that precede this cell_id
+        // Emit pending cells that precede this cell id
         while let Some(pending_cell) = pending.front() {
             if pending_cell.cell_id() >= cell_id {
                 break;
             }
             let cell = pending.pop_front().unwrap();
             collapse_detector.observe_cell(&cell);
-            emit(cell)?;
+            emit_cell(cell)?;
             stats.cells_output += 1;
         }
 
         // Take the cell from this input
-        let mut merged = inputs[entry.input_idx].take().unwrap();
+        let mut merged = inputs[entry.index].take().unwrap();
 
         // Advance the input and re-add to heap if it has more
-        if let Some(next_id) = inputs[entry.input_idx].current_cell_id() {
+        if let Some(next_id) = inputs[entry.index].current_cell_id() {
             stats.cells_input += 1;
-            heap.push(MergeHeapEntry {
-                cell_id: next_id,
-                input_idx: entry.input_idx,
-            });
+            heap.push(MergeHeapEntry { cell_id: next_id, index: entry.index });
         }
 
-        // Collect other inputs with the same cell_id
+        // Collect other inputs with the same cell id
         while let Some(top) = heap.peek() {
             if top.cell_id != cell_id {
                 break;
             }
             let other_entry = heap.pop().unwrap();
-            let other_cell = inputs[other_entry.input_idx].take().unwrap();
+            let other_cell = inputs[other_entry.index].take().unwrap();
 
             merged = merge_cells(merged, other_cell);
             stats.cells_merged += 1;
 
             // Advance and re-add
-            if let Some(next_id) = inputs[other_entry.input_idx].current_cell_id() {
+            if let Some(next_id) = inputs[other_entry.index].current_cell_id() {
                 stats.cells_input += 1;
                 heap.push(MergeHeapEntry {
                     cell_id: next_id,
-                    input_idx: other_entry.input_idx,
+                    index: other_entry.index,
                 });
             }
         }
@@ -519,7 +513,7 @@ where
                 .map_or(true, |p| merged.cell_id() < p.cell_id())
             {
                 collapse_detector.observe_cell(&merged);
-                emit(merged)?;
+                emit_cell(merged)?;
                 stats.cells_output += 1;
             } else {
                 // Insert in sorted order
@@ -535,7 +529,7 @@ where
     // Emit remaining pending cells
     for cell in pending {
         collapse_detector.observe_cell(&cell);
-        emit(cell)?;
+        emit_cell(cell)?;
         stats.cells_output += 1;
     }
 

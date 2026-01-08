@@ -456,6 +456,41 @@ impl QuadtreeCellId {
     }
 }
 
+  enum MergeResult {
+      Emitted,
+      Bubble(Vec<QuadtreeCell>),  // "you handle these"
+  }
+
+  fn merge_cell(
+      cell_id: QuadtreeCellId,
+      segments: &[Segment],
+      options: &MergeOptions,
+      emit: &mut impl FnMut(QuadtreeCell),
+  ) -> MergeResult {
+      // ... descend logic ...
+
+      if have_children {
+          let child_results: Vec<_> = cell_id.children().unwrap()
+              .map(|c| merge_cell(c, segments, options, emit))
+              .collect();
+
+          // All children bubbled up sparse cells?
+          if all_bubbled(&child_results) {
+              let combined = collect_all_bubbled(&child_results);
+              if combined.total_edges() < options.collapse_threshold {
+                  // Bubble further up
+                  return MergeResult::Bubble(combined);
+              }
+          }
+          // Emit what bubbled, we're the stop
+          emit_all(child_results, emit);
+          MergeResult::Emitted
+      } else {
+          // Leaf - bubble up for parent to decide
+          MergeResult::Bubble(merge_leaves(...))
+      }
+  }
+
 #[cfg(test)]
 mod tests {
     use super::*;
