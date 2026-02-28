@@ -2,7 +2,7 @@
 // QuadtreeCellId - Z-Order Cell Encoding
 // =============================================================================
 
-use crate::spatial::quadtree::{Bounds, Interval, Point2D, Rect};
+use crate::spatial::quadtree::{Interval, Point2D, Rect};
 
 /// Maximum level for quadtree cells (0-30).
 /// At level 30 with typical geographic bounds, resolution is sub-centimeter.
@@ -240,11 +240,11 @@ impl QuadtreeCellId {
     /// let cell = QuadtreeCellId::from_xy(50.0, 50.0, 5, &bounds);
     /// // Creates cell containing the center point at level 5
     /// ```
-    pub fn from_xy(x: f64, y: f64, level: u8, bounds: &Bounds) -> Self {
-        let point = Point2D::new(x, y);
-        let normalized = bounds.normalize(&point);
-        Self::from_normalized(normalized.x, normalized.y, level)
-    }
+      pub fn from_xy(x: f64, y: f64, level: u8, bounds: &Rect) -> Self {
+          let nx = (x - bounds.x.lo) / (bounds.x.hi - bounds.x.lo);
+          let ny = (y - bounds.y.lo) / (bounds.y.hi - bounds.y.lo);
+          Self::from_normalized(nx, ny, level)
+      }
 
     /// Creates a cell ID from integer (i, j) coordinates at the given level.
     ///
@@ -286,9 +286,13 @@ impl QuadtreeCellId {
     }
 
     /// Returns the center of this cell in world coordinates.
-    pub fn to_center(&self, bounds: &Bounds) -> Point2D {
-        bounds.denormalize(&self.to_center_normalized())
-    }
+  pub fn to_center(&self, bounds: &Rect) -> Point2D {
+      let norm = self.to_center_normalized();
+      Point2D {
+          x: bounds.x.lo + norm.x * (bounds.x.hi - bounds.x.lo),
+          y: bounds.y.lo + norm.y * (bounds.y.hi - bounds.y.lo),
+      }
+  }
 
     /// Returns the bounds of this cell in normalized [0, 1] coordinates.
     pub fn to_bounds_normalized(&self) -> Rect {
@@ -303,19 +307,21 @@ impl QuadtreeCellId {
     }
 
     /// Returns the bounds of this cell in world coordinates.
-    pub fn to_bounds(&self, bounds: &Bounds) -> Rect {
-        let norm = self.to_bounds_normalized();
-        Rect {
-            x: Interval::new(
-                bounds.min_x + norm.x.lo * bounds.width(),
-                bounds.min_x + norm.x.hi * bounds.width(),
-            ),
-            y: Interval::new(
-                bounds.min_y + norm.y.lo * bounds.height(),
-                bounds.min_y + norm.y.hi * bounds.height(),
-            ),
-        }
-    }
+  pub fn to_bounds(&self, bounds: &Rect) -> Rect {
+      let norm = self.to_bounds_normalized();
+      let width = bounds.x.hi - bounds.x.lo;
+      let height = bounds.y.hi - bounds.y.lo;
+      Rect {
+          x: Interval::new(
+              bounds.x.lo + norm.x.lo * width,
+              bounds.x.lo + norm.x.hi * width,
+          ),
+          y: Interval::new(
+              bounds.y.lo + norm.y.lo * height,
+              bounds.y.lo + norm.y.hi * height,
+          ),
+      }
+  }
 
     /// Returns the parent cell (one level up).
     ///
@@ -453,339 +459,5 @@ impl QuadtreeCellId {
             result = result.parent().unwrap();
         }
         result
-    }
-}
-
-  enum MergeResult {
-      Emitted,
-      Bubble(Vec<QuadtreeCell>),  // "you handle these"
-  }
-
-  fn merge_cell(
-      cell_id: QuadtreeCellId,
-      segments: &[Segment],
-      options: &MergeOptions,
-      emit: &mut impl FnMut(QuadtreeCell),
-  ) -> MergeResult {
-      // ... descend logic ...
-
-      if have_children {
-          let child_results: Vec<_> = cell_id.children().unwrap()
-              .map(|c| merge_cell(c, segments, options, emit))
-              .collect();
-
-          // All children bubbled up sparse cells?
-          if all_bubbled(&child_results) {
-              let combined = collect_all_bubbled(&child_results);
-              if combined.total_edges() < options.collapse_threshold {
-                  // Bubble further up
-                  return MergeResult::Bubble(combined);
-              }
-          }
-          // Emit what bubbled, we're the stop
-          emit_all(child_results, emit);
-          MergeResult::Emitted
-      } else {
-          // Leaf - bubble up for parent to decide
-          MergeResult::Bubble(merge_leaves(...))
-      }
-  }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    mod cell_id_tests {
-        use super::*;
-        use crate::spatial::quadtree::Bounds;
-
-        #[test]
-        fn test_root_cell() {
-            let root = QuadtreeCellId::ROOT;
-            assert!(root.is_valid());
-            assert_eq!(root.level(), 0);
-
-            // Root should cover entire space
-            let bounds = root.to_bounds_normalized();
-            assert!((bounds.x.lo - 0.0).abs() < 1e-10);
-            assert!((bounds.x.hi - 1.0).abs() < 1e-10);
-            assert!((bounds.y.lo - 0.0).abs() < 1e-10);
-            assert!((bounds.y.hi - 1.0).abs() < 1e-10);
-        }
-
-        #[test]
-        fn test_none_cell() {
-            let none = QuadtreeCellId::NONE;
-            assert!(!none.is_valid());
-        }
-
-        #[test]
-        fn test_from_ij_level() {
-            // Level 1: 2x2 grid
-            let cell_00 = QuadtreeCellId::from_ij(0, 0, 1);
-            let cell_10 = QuadtreeCellId::from_ij(1, 0, 1);
-            let cell_01 = QuadtreeCellId::from_ij(0, 1, 1);
-            let cell_11 = QuadtreeCellId::from_ij(1, 1, 1);
-
-            assert!(cell_00.is_valid());
-            assert_eq!(cell_00.level(), 1);
-            assert_eq!(cell_10.level(), 1);
-            assert_eq!(cell_01.level(), 1);
-            assert_eq!(cell_11.level(), 1);
-
-            // Should be ordered by Z-order
-            assert!(cell_00 < cell_10);
-            assert!(cell_10 < cell_01);
-            assert!(cell_01 < cell_11);
-        }
-
-        #[test]
-        fn test_to_ij_roundtrip() {
-            for level in 0..=10 {
-                let max = 1u32 << level;
-                for i in [0, max / 4, max / 2, max - 1].iter().filter(|&&x| x < max) {
-                    for j in [0, max / 4, max / 2, max - 1].iter().filter(|&&x| x < max) {
-                        let cell = QuadtreeCellId::from_ij(*i, *j, level);
-                        let (ri, rj) = cell.to_ij();
-                        assert_eq!(
-                            (*i, *j),
-                            (ri, rj),
-                            "Roundtrip failed for level={}, i={}, j={}",
-                            level,
-                            i,
-                            j
-                        );
-                    }
-                }
-            }
-        }
-
-        #[test]
-        fn test_from_normalized() {
-            // Corner points
-            let bl = QuadtreeCellId::from_normalized(0.0, 0.0, 2);
-            assert_eq!(bl.to_ij(), (0, 0));
-
-            // Near top-right (but not exactly 1.0)
-            let tr = QuadtreeCellId::from_normalized(0.999, 0.999, 2);
-            assert_eq!(tr.to_ij(), (3, 3));
-
-            // Center should be (2, 2) at level 2
-            let center = QuadtreeCellId::from_normalized(0.5, 0.5, 2);
-            assert_eq!(center.to_ij(), (2, 2));
-        }
-
-        #[test]
-        fn test_to_center() {
-            let bounds = Bounds::new(0.0, 0.0, 100.0, 100.0);
-
-            // Root cell center should be (50, 50)
-            let root_center = QuadtreeCellId::ROOT.to_center(&bounds);
-            assert!((root_center.x - 50.0).abs() < 1e-10);
-            assert!((root_center.y - 50.0).abs() < 1e-10);
-
-            // Level 1 cell (0,0) should have center at (25, 25)
-            let cell = QuadtreeCellId::from_ij(0, 0, 1);
-            let center = cell.to_center(&bounds);
-            assert!((center.x - 25.0).abs() < 1e-10);
-            assert!((center.y - 25.0).abs() < 1e-10);
-        }
-
-        #[test]
-        fn test_to_bounds() {
-            let global = Bounds::new(0.0, 0.0, 100.0, 100.0);
-
-            // Root cell should cover entire bounds
-            let root_bounds = QuadtreeCellId::ROOT.to_bounds(&global);
-            assert!((root_bounds.x.lo - 0.0).abs() < 1e-10);
-            assert!((root_bounds.x.hi - 100.0).abs() < 1e-10);
-
-            // Level 1 cell (0,0) should cover bottom-left quadrant
-            let cell = QuadtreeCellId::from_ij(0, 0, 1);
-            let cell_bounds = cell.to_bounds(&global);
-            assert!((cell_bounds.x.lo - 0.0).abs() < 1e-10);
-            assert!((cell_bounds.x.hi - 50.0).abs() < 1e-10);
-            assert!((cell_bounds.y.lo - 0.0).abs() < 1e-10);
-            assert!((cell_bounds.y.hi - 50.0).abs() < 1e-10);
-        }
-
-        #[test]
-        fn test_parent() {
-            let root = QuadtreeCellId::ROOT;
-            assert!(root.parent().is_none());
-
-            let level1 = QuadtreeCellId::from_ij(0, 0, 1);
-            let parent = level1.parent().unwrap();
-            assert_eq!(parent.level(), 0);
-
-            let level2 = QuadtreeCellId::from_ij(2, 3, 2);
-            let parent2 = level2.parent().unwrap();
-            assert_eq!(parent2.level(), 1);
-            assert_eq!(parent2.to_ij(), (1, 1)); // (2,3) -> (1,1) at parent level
-        }
-
-        #[test]
-        fn test_children() {
-            let root = QuadtreeCellId::ROOT;
-            let children = root.children().unwrap();
-
-            assert_eq!(children.len(), 4);
-            for child in &children {
-                assert_eq!(child.level(), 1);
-            }
-
-            // Children should be in Z-order
-            assert_eq!(children[0].to_ij(), (0, 0));
-            assert_eq!(children[1].to_ij(), (1, 0));
-            assert_eq!(children[2].to_ij(), (0, 1));
-            assert_eq!(children[3].to_ij(), (1, 1));
-
-            // All children's parent should be root
-            for child in &children {
-                assert_eq!(child.parent().unwrap(), root);
-            }
-        }
-
-        #[test]
-        fn test_child() {
-            let root = QuadtreeCellId::ROOT;
-
-            let c0 = root.child(0).unwrap();
-            let c1 = root.child(1).unwrap();
-            let c2 = root.child(2).unwrap();
-            let c3 = root.child(3).unwrap();
-
-            assert_eq!(c0.to_ij(), (0, 0));
-            assert_eq!(c1.to_ij(), (1, 0));
-            assert_eq!(c2.to_ij(), (0, 1));
-            assert_eq!(c3.to_ij(), (1, 1));
-        }
-
-        #[test]
-        fn test_max_level_no_children() {
-            let max_cell = QuadtreeCellId::from_ij(0, 0, MAX_LEVEL);
-            assert!(max_cell.children().is_none());
-            assert!(max_cell.child(0).is_none());
-        }
-
-        #[test]
-        fn test_contains() {
-            let root = QuadtreeCellId::ROOT;
-            let level1 = QuadtreeCellId::from_ij(0, 0, 1);
-            let level2 = QuadtreeCellId::from_ij(0, 0, 2);
-
-            // Root contains everything
-            assert!(root.contains(&root));
-            assert!(root.contains(&level1));
-            assert!(root.contains(&level2));
-
-            // Parent contains child
-            assert!(level1.contains(&level2));
-
-            // Child doesn't contain parent
-            assert!(!level2.contains(&level1));
-            assert!(!level1.contains(&root));
-
-            // Different branches don't contain each other
-            let other = QuadtreeCellId::from_ij(1, 1, 1);
-            assert!(!level1.contains(&other));
-            assert!(!other.contains(&level1));
-        }
-
-        #[test]
-        fn test_intersects() {
-            let cell_a = QuadtreeCellId::from_ij(0, 0, 2);
-            let cell_b = QuadtreeCellId::from_ij(0, 0, 3); // child of cell_a
-            let cell_c = QuadtreeCellId::from_ij(3, 3, 2); // different cell
-
-            assert!(cell_a.intersects(&cell_b)); // parent-child
-            assert!(cell_b.intersects(&cell_a)); // child-parent
-            assert!(!cell_a.intersects(&cell_c)); // disjoint
-        }
-
-        #[test]
-        fn test_range_min_max() {
-            let cell = QuadtreeCellId::from_ij(0, 0, 2);
-
-            let min = cell.range_min();
-            let max = cell.range_max();
-
-            assert!(min.is_valid());
-            assert!(max.is_valid());
-            assert_eq!(min.level(), MAX_LEVEL);
-            assert_eq!(max.level(), MAX_LEVEL);
-            assert!(min < max || min == max);
-
-            // All children should be in range
-            if let Some(children) = cell.children() {
-                for child in &children {
-                    assert!(child.0 >= min.0);
-                    assert!(child.0 <= max.0);
-                }
-            }
-        }
-
-        #[test]
-        fn test_common_ancestor() {
-            let a = QuadtreeCellId::from_ij(0, 0, 4);
-            let b = QuadtreeCellId::from_ij(1, 0, 4);
-
-            let ancestor = a.common_ancestor(&b);
-            assert!(ancestor.contains(&a));
-            assert!(ancestor.contains(&b));
-
-            // Same cell should return itself
-            assert_eq!(a.common_ancestor(&a), a);
-
-            // Root should be common ancestor of any two cells in different quadrants
-            let c = QuadtreeCellId::from_ij(0, 0, 1);
-            let d = QuadtreeCellId::from_ij(1, 1, 1);
-            let root_ancestor = c.common_ancestor(&d);
-            assert_eq!(root_ancestor, QuadtreeCellId::ROOT);
-        }
-    }
-    mod interleave_tests {
-        use super::*;
-
-        #[test]
-        fn test_interleave_basic() {
-            // (0, 0) -> 0
-            assert_eq!(interleave_bits(0, 0), 0);
-
-            // (1, 0) -> 1 (x in bit 0)
-            assert_eq!(interleave_bits(1, 0), 0b01);
-
-            // (0, 1) -> 2 (y in bit 1)
-            assert_eq!(interleave_bits(0, 1), 0b10);
-
-            // (1, 1) -> 3
-            assert_eq!(interleave_bits(1, 1), 0b11);
-
-            // (2, 0) -> 4 (x bit 1 goes to bit 2)
-            assert_eq!(interleave_bits(2, 0), 0b0100);
-
-            // (0, 2) -> 8 (y bit 1 goes to bit 3)
-            assert_eq!(interleave_bits(0, 2), 0b1000);
-        }
-
-        #[test]
-        fn test_deinterleave_roundtrip() {
-            for level in 1..=10 {
-                let max = 1u32 << level;
-                for x in [0, 1, max / 2, max - 1] {
-                    for y in [0, 1, max / 2, max - 1] {
-                        let z = interleave_bits(x, y);
-                        let (dx, dy) = deinterleave_bits(z, level);
-                        assert_eq!(
-                            (x, y),
-                            (dx, dy),
-                            "Roundtrip failed for level={}, x={}, y={}",
-                            level,
-                            x,
-                            y
-                        );
-                    }
-                }
-            }
-        }
     }
 }

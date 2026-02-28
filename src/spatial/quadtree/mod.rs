@@ -9,9 +9,11 @@ mod geometry_server;
 mod plane;
 mod builder;
 mod cell_id;
-mod geometry;
+mod point;
+mod interval;
+mod rect;
 mod geometry_reader;
-mod index;
+mod padded_cell;
 mod input_iterator;
 mod interior_tracker;
 mod merge;
@@ -20,15 +22,14 @@ mod query;
 mod segment;
 mod collapse_detector;
 
+pub use cell_id::QuadtreeCellId;
 pub use builder::{BuilderOptions, QuadtreeIndex, QuadtreeIndexBuilder};
 pub use cell_id::{QuadtreeCellId, MAX_LEVEL};
-pub use geometry::{Bounds, Interval, Point2D, Rect};
 pub use geometry_reader::{
     CacheStats, GeometryCache, GeometryReader, InMemoryGeometryReader, LruGeometryCache,
 };
-pub use index::{ClippedShape, PaddedCell, QuadtreeCell};
-pub use input_iterator::{DeleteBitSet, DocIdMap, InputIterator};
-pub use interior_tracker::{contains_tracker_origin, InteriorTracker, ShapeIdSet};
+pub use input_iterator::{InputIterator};
+pub use interior_tracker::{contains_tracker_origin, InteriorTracker};
 pub use merge::{merge, MergeOptions, MergeStats};
 pub use predicates::{
     brute_force_contains_2d, compute_origin_inside_2d, contains_with_edges_2d,
@@ -36,3 +37,6 @@ pub use predicates::{
     EdgeCrosser2D,
 };
 pub use query::contains_point;
+pub use point::Point2D;
+pub use interval::Interval;
+pub use rect::Rect;

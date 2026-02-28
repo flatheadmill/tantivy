@@ -10,8 +10,10 @@ use common::CountingWriter;
 
 use crate::directory::WritePtr;
 use crate::spatial::quadtree::{
-    contains_tracker_origin, InteriorTracker, Point2D, QuadtreeCellId, Rect,
+    contains_tracker_origin, InteriorTracker, QuadtreeCellId, Rect,
 };
+use crate::spatial::surface::Surface;
+use crate::spatial::{Cell, PaddedCell, ClippedShape};
 
 // =============================================================================
 // Configuration Constants
@@ -37,15 +39,10 @@ pub const MIN_SHORT_EDGE_FRACTION: f64 = 0.1;
 // FaceEdge - Original Edge Data with Metadata
 // =============================================================================
 
-/// Edge data for index construction.
-///
-/// A FaceEdge represents a single edge from a shape, with metadata needed
-/// for index building. Unlike S2 which projects to cube faces, we work
-/// directly in the 2D coordinate space.
 #[derive(Debug, Clone)]
-struct FaceEdge {
-    /// Shape/document ID.
-    shape_id: u32,
+struct Edge<S: Surface> {
+    /// Associate geometry.
+    geometry_id: u32,
 
     /// Edge index within the shape (0 to num_edges-1).
     edge_id: u16,
@@ -58,25 +55,25 @@ struct FaceEdge {
     max_level: u8,
 
     /// First endpoint of the edge.
-    v0: Point2D,
+    v0: S::Point,
 
     /// Second endpoint of the edge.
-    v1: Point2D,
+    v1: S::Point,
 }
 
-impl FaceEdge {
+impl<S: Surface> Edge<S> {
     /// Creates a new FaceEdge.
     fn new(
-        shape_id: u32,
+        surface: &S,
+        geometry_id: u32,
         edge_id: u16,
         has_interior: bool,
-        v0: Point2D,
-        v1: Point2D,
-        global_bounds: &Bounds,
+        v0: S::Point,
+        v1: S::Point,
     ) -> Self {
-        let max_level = Self::compute_max_level(&v0, &v1, global_bounds);
+        let max_level = surface.compute_max_level(&v0, &v1);
         Self {
-            shape_id,
+            geometry_id,
             edge_id,
             has_interior,
             max_level,
@@ -85,36 +82,6 @@ impl FaceEdge {
         }
     }
 
-    /// Computes the first level at which this edge is considered "long".
-    ///
-    /// An edge is "long" at a given level if the cell edge length at that level
-    /// is less than the edge length multiplied by CELL_SIZE_TO_LONG_EDGE_RATIO.
-    fn compute_max_level(v0: &Point2D, v1: &Point2D, global_bounds: &Bounds) -> u8 {
-        let dx = v1.x - v0.x;
-        let dy = v1.y - v0.y;
-        let edge_length = (dx * dx + dy * dy).sqrt();
-
-        if edge_length == 0.0 {
-            return QuadtreeCellId::MAX_LEVEL;
-        }
-
-        // The cell edge length at which this edge becomes "long"
-        let max_cell_edge = edge_length * CELL_SIZE_TO_LONG_EDGE_RATIO;
-
-        // Find the level where cell edge <= max_cell_edge
-        let span = (global_bounds.max_x - global_bounds.min_x)
-            .max(global_bounds.max_y - global_bounds.min_y);
-
-        let mut level = 0u8;
-        let mut cell_edge = span;
-
-        while cell_edge > max_cell_edge && level < QuadtreeCellId::MAX_LEVEL {
-            cell_edge /= 2.0;
-            level += 1;
-        }
-
-        level
-    }
 }
 
 // =============================================================================
@@ -126,32 +93,25 @@ impl FaceEdge {
 /// During index construction, edges are recursively clipped to child cells.
 /// The ClippedEdge stores a reference to the original FaceEdge plus the
 /// clipped bounding box.
-#[derive(Debug, Clone)]
-struct ClippedEdge<'a> {
+#[derive(Clone)]
+struct ClippedEdge<'a, S: Surface> {
     /// Reference to the original edge data.
-    face_edge: &'a FaceEdge,
+    edge: &'a Edge<S>,
 
     /// Clipped bounding rectangle in world coordinates.
     /// This is progressively shrunk as we descend the tree.
-    bound: Rect,
+    bounds: S::Rect,
 }
 
-impl<'a> ClippedEdge<'a> {
+impl<'a, S: Surface> ClippedEdge<'a, S> {
     /// Creates a ClippedEdge from a FaceEdge with initial bounds.
-    fn from_face_edge(face_edge: &'a FaceEdge) -> Self {
-        // FIX: Use from_coords with min/max instead of non-existent from_point_pair
-        let bound = Rect::from_coords(
-            face_edge.v0.x.min(face_edge.v1.x),
-            face_edge.v0.y.min(face_edge.v1.y),
-            face_edge.v0.x.max(face_edge.v1.x),
-            face_edge.v0.y.max(face_edge.v1.y),
-        );
-        Self { face_edge, bound }
+    fn from_edge(surface: &S, edge: &'a Edge<S>) -> Self {
+        Self { edge, bounds: surface.edge_bound(&edge.v0, &edge.v1) }
     }
 
     /// Creates a ClippedEdge with a specified bound.
-    fn with_bound(face_edge: &'a FaceEdge, bound: Rect) -> Self {
-        Self { face_edge, bound }
+    fn with_bound(edge: &'a Edge<S>, bounds: S::Rect) -> Self {
+        Self { edge, bounds }
     }
 }
 
@@ -161,19 +121,19 @@ impl<'a> ClippedEdge<'a> {
 
 /// Information about a shape being indexed.
 #[derive(Debug, Clone)]
-struct ShapeData {
+struct ShapeData<S: Surface> {
     /// Document/shape ID.
     geometry_id: u32,
 
     /// Vertices of the shape (closed polygon: first == last).
-    vertices: Vec<Point2D>,
+    vertices: Vec<S::Point>,
 
     /// Whether this shape has an interior (dimension 2).
     has_interior: bool,
 }
 
 // =============================================================================
-// QuadtreeIndexBuilder - Main Builder
+// IndexBuilder - Main Builder
 // =============================================================================
 
 /// Configuration for index building.
@@ -200,7 +160,7 @@ impl Default for BuilderOptions {
 /// # Usage
 ///
 /// ```ignore
-/// let mut builder = QuadtreeIndexBuilder::new(bounds);
+/// let mut builder = IndexBuilder::new(bounds);
 ///
 /// // Add shapes (polygons with geometry_id)
 /// builder.add_shape(0, &polygon1_vertices);
@@ -214,25 +174,25 @@ impl Default for BuilderOptions {
 ///     // Process cells...
 /// }
 /// ```
-pub struct QuadtreeIndexBuilder {
-    /// Global coordinate bounds.
-    bounds: Bounds,
+pub struct IndexBuilder<S: Surface> {
+    /// Surface.
+    surface: S,
 
     /// Builder options.
     options: BuilderOptions,
 
     /// Shapes to be indexed.
-    shapes: Vec<ShapeData>,
+    shapes: Vec<ShapeData<S>>,
 
     /// Edges from all shapes.
-    edges: Vec<FaceEdge>,
+    edges: Vec<Edge<S>>,
 }
 
-impl QuadtreeIndexBuilder {
+impl<S: Surface> IndexBuilder<S> {
     /// Creates a new builder with the given global bounds.
-    pub fn new(bounds: Bounds) -> Self {
+    pub fn new(surface: S) -> Self {
         Self {
-            bounds,
+            surface,
             options: BuilderOptions::default(),
             shapes: Vec::new(),
             edges: Vec::new(),
@@ -240,9 +200,9 @@ impl QuadtreeIndexBuilder {
     }
 
     /// Creates a new builder with custom options.
-    pub fn with_options(bounds: Bounds, options: BuilderOptions) -> Self {
+    pub fn with_options(surface: S, options: BuilderOptions) -> Self {
         Self {
-            bounds,
+            surface,
             options,
             shapes: Vec::new(),
             edges: Vec::new(),
@@ -250,7 +210,7 @@ impl QuadtreeIndexBuilder {
     }
 
     /// Returns the global bounds.
-    pub fn bounds(&self) -> &Bounds {
+    pub fn bounds(&self) -> &Rect {
         &self.bounds
     }
 
@@ -269,7 +229,7 @@ impl QuadtreeIndexBuilder {
     /// # Panics
     ///
     /// Panics if vertices has fewer than 3 points.
-    pub fn add_shape(&mut self, geometry_id: u32, vertices: &[Point2D]) {
+    pub fn add_shape(&mut self, geometry_id: u32, vertices: &[S::Point]) {
         assert!(vertices.len() >= 3, "Polygon must have at least 3 vertices");
 
         let has_interior = true; // Polygons have interiors
@@ -287,7 +247,7 @@ impl QuadtreeIndexBuilder {
             let v0 = vertices[i];
             let v1 = vertices[(i + 1) % n];
 
-            self.edges.push(FaceEdge::new(
+            self.edges.push(Edge::new(
                 geometry_id,
                 i as u16,
                 has_interior,
@@ -304,7 +264,7 @@ impl QuadtreeIndexBuilder {
     ///
     /// * `geometry_id` - The document ID for this shape
     /// * `vertices` - The polyline vertices in order
-    pub fn add_polyline(&mut self, geometry_id: u32, vertices: &[Point2D]) {
+    pub fn add_polyline(&mut self, geometry_id: u32, vertices: &[S::Point]) {
         if vertices.len() < 2 {
             return; // Polylines need at least 2 vertices
         }
@@ -319,7 +279,7 @@ impl QuadtreeIndexBuilder {
 
         // Create edges (n-1 edges for n vertices)
         for i in 0..vertices.len() - 1 {
-            self.edges.push(FaceEdge::new(
+            self.edges.push(Edge::new(
                 geometry_id,
                 i as u16,
                 has_interior,
@@ -343,7 +303,7 @@ impl QuadtreeIndexBuilder {
     /// Builds the quadtree index.
     ///
     /// This consumes the builder and returns the final index.
-    pub fn build(self) -> QuadtreeIndex {
+    pub fn build(self) -> Index<S> {
         if self.edges.is_empty() {
             // Handle empty index (shapes with interiors but no edges)
             return self.build_empty_index();
@@ -362,7 +322,7 @@ impl QuadtreeIndexBuilder {
 
         // Create initial clipped edges
         let clipped_edges: Vec<ClippedEdge> =
-            self.edges.iter().map(ClippedEdge::from_face_edge).collect();
+            self.edges.iter().map(ClippedEdge::from_edge).collect();
 
         // Compute bounding box of all edges
         // FIX: Use union instead of union_rect
@@ -372,28 +332,27 @@ impl QuadtreeIndexBuilder {
         }
 
         // Create root padded cell
-        let root_pcell = PaddedCell::root(self.options.cell_padding, &self.bounds);
-
+        let root_pcell = self.surface.root_cell(self.options.cell_padding);
         // Try to shrink to a tighter starting cell
-        let start_id = root_pcell.shrink_to_fit(&all_bounds, &self.bounds);
-        let start_pcell = PaddedCell::new(start_id, self.options.cell_padding, &self.bounds);
+        let start_id = root_pcell.shrink_to_fit(&all_bounds);
+        let start_pcell = self.surface.padded_cell(start_id, self.options.cell_padding);
 
         // Build the cell map
-        let mut cells: BTreeMap<QuadtreeCellId, QuadtreeCell> = BTreeMap::new();
+        let mut cells: BTreeMap<S::CellId, Cell<S::CellId>> = BTreeMap::new();
 
         // Recursively build the index
         self.update_edges(&start_pcell, &clipped_edges, &mut tracker, &mut cells);
 
-        QuadtreeIndex {
-            bounds: self.bounds,
+        Index {
+            surface: self.surface,
             cells,
         }
     }
 
     /// Builds an empty index (for shapes with no edges but possibly with interiors).
-    fn build_empty_index(self) -> QuadtreeIndex {
-        QuadtreeIndex {
-            bounds: self.bounds,
+    fn build_empty_index(self) -> Index<S> {
+        Index {
+            surface: self.surface,
             cells: BTreeMap::new(),
         }
     }
@@ -401,10 +360,10 @@ impl QuadtreeIndexBuilder {
     /// Recursively processes edges and creates index cells.
     fn update_edges(
         &self,
-        pcell: &PaddedCell,
-        edges: &[ClippedEdge],
+        pcell: &S::PaddedCell,
+        edges: &[ClippedEdge<S>],
         tracker: &mut InteriorTracker,
-        cells: &mut BTreeMap<QuadtreeCellId, QuadtreeCell>,
+        cells: &mut BTreeMap<S::CellId, Cell<S::CellId>>,
     ) {
         // Try to create an index cell at this level
         if self.make_index_cell(pcell, edges, tracker, cells) {
@@ -450,9 +409,9 @@ impl QuadtreeIndexBuilder {
     /// Clips an edge to the four child quadrants.
     fn clip_edge_to_children<'a>(
         &self,
-        edge: &ClippedEdge<'a>,
+        edge: &ClippedEdge<'a, S>,
         middle: &Rect,
-        child_edges: &mut [[Vec<ClippedEdge<'a>>; 2]; 2],
+        child_edges: &mut [[Vec<ClippedEdge<'a, S>>; 2]; 2],
     ) {
         // Determine which children the edge's bound intersects
         let bound = &edge.bound;
@@ -493,10 +452,10 @@ impl QuadtreeIndexBuilder {
     /// Clips an edge along the V (Y) axis and adds to children.
     fn clip_v_axis<'a>(
         &self,
-        edge: &ClippedEdge<'a>,
+        edge: &ClippedEdge<'a, S>,
         middle: &Rect,
         i: usize,
-        child_edges: &mut [[Vec<ClippedEdge<'a>>; 2]; 2],
+        child_edges: &mut [[Vec<ClippedEdge<'a, S>>; 2]; 2],
     ) {
         if edge.bound.y.hi <= middle.y.lo {
             // Entirely in bottom child
@@ -515,7 +474,7 @@ impl QuadtreeIndexBuilder {
     ///
     /// If `clip_hi` is true, clips the high end to `u`.
     /// If `clip_hi` is false, clips the low end to `u`.
-    fn clip_u_bound<'a>(&self, edge: &ClippedEdge<'a>, clip_hi: bool, u: f64) -> ClippedEdge<'a> {
+    fn clip_u_bound<'a>(&self, edge: &ClippedEdge<'a, S>, clip_hi: bool, u: f64) -> ClippedEdge<'a, S> {
         let mut new_bound = edge.bound;
 
         if clip_hi {
@@ -531,7 +490,7 @@ impl QuadtreeIndexBuilder {
         }
 
         // Interpolate V bound based on where the edge crosses U = u
-        let fe = edge.face_edge;
+        let fe = edge.edge;
         if (fe.v1.x - fe.v0.x).abs() > f64::EPSILON {
             let t = (u - fe.v0.x) / (fe.v1.x - fe.v0.x);
             if t > 0.0 && t < 1.0 {
@@ -559,11 +518,11 @@ impl QuadtreeIndexBuilder {
             }
         }
 
-        ClippedEdge::with_bound(edge.face_edge, new_bound)
+        ClippedEdge::with_bound(edge.edge, new_bound)
     }
 
     /// Clips the V (Y) bound of an edge.
-    fn clip_v_bound<'a>(&self, edge: &ClippedEdge<'a>, clip_hi: bool, v: f64) -> ClippedEdge<'a> {
+    fn clip_v_bound<'a>(&self, edge: &ClippedEdge<'a, S>, clip_hi: bool, v: f64) -> ClippedEdge<'a, S> {
         let mut new_bound = edge.bound;
 
         if clip_hi {
@@ -579,7 +538,7 @@ impl QuadtreeIndexBuilder {
         }
 
         // Interpolate U bound based on where the edge crosses V = v
-        let fe = edge.face_edge;
+        let fe = edge.edge;
         if (fe.v1.y - fe.v0.y).abs() > f64::EPSILON {
             let t = (v - fe.v0.y) / (fe.v1.y - fe.v0.y);
             if t > 0.0 && t < 1.0 {
@@ -603,18 +562,15 @@ impl QuadtreeIndexBuilder {
             }
         }
 
-        ClippedEdge::with_bound(edge.face_edge, new_bound)
+        ClippedEdge::with_bound(edge.edge, new_bound)
     }
 
-    /// Attempts to create an index cell at this level.
-    ///
-    /// Returns true if a cell was created, false if subdivision is needed.
-    fn make_index_cell(
+    fn make_index_cell<'a>(
         &self,
-        pcell: &PaddedCell,
-        edges: &[ClippedEdge],
+        pcell: &S::PaddedCell,
+        edges: &[ClippedEdge<'a, S>],
         tracker: &mut InteriorTracker,
-        cells: &mut BTreeMap<QuadtreeCellId, QuadtreeCell>,
+        cells: &mut BTreeMap<S::CellId, Cell<S::CellId>>,
     ) -> bool {
         // Early exit if nothing to do
         if edges.is_empty() && tracker.shape_ids().is_empty() {
@@ -632,7 +588,7 @@ impl QuadtreeIndexBuilder {
 
             let mut short_count = 0;
             for edge in edges {
-                if pcell.level() < edge.face_edge.max_level {
+                if pcell.level() < edge.edge.max_level {
                     short_count += 1;
                     if short_count > max_short {
                         return false; // Need to subdivide
@@ -667,7 +623,7 @@ impl QuadtreeIndexBuilder {
         }
 
         // Build the cell
-        let mut cell = QuadtreeCell::with_capacity(pcell.id(), num_shapes);
+        let mut cell = Cell::<S::CellId>::with_capacity(pcell.id(), num_shapes);
 
         // Merge edge shapes and containing shapes
         let mut edge_idx = 0;
@@ -675,7 +631,7 @@ impl QuadtreeIndexBuilder {
 
         while edge_idx < edges.len() || containing_iter.peek().is_some() {
             let edge_shape_id = if edge_idx < edges.len() {
-                edges[edge_idx].face_edge.shape_id
+                edges[edge_idx].edge.shape_id
             } else {
                 u32::MAX
             };
@@ -693,8 +649,8 @@ impl QuadtreeIndexBuilder {
                 let mut clipped = ClippedShape::new(shape_id, false);
 
                 // Collect all edges for this shape
-                while edge_idx < edges.len() && edges[edge_idx].face_edge.shape_id == shape_id {
-                    clipped.add_edge(edges[edge_idx].face_edge.edge_id);
+                while edge_idx < edges.len() && edges[edge_idx].edge.shape_id == shape_id {
+                    clipped.add_edge(edges[edge_idx].edge.edge_id);
                     edge_idx += 1;
                 }
 
@@ -721,26 +677,26 @@ impl QuadtreeIndexBuilder {
     }
 
     /// Tests all edges with interiors against the tracker.
-    fn test_all_edges(&self, edges: &[ClippedEdge], tracker: &mut InteriorTracker) {
+    fn test_all_edges(&self, edges: &[ClippedEdge<S>], tracker: &mut InteriorTracker) {
         for edge in edges {
-            if edge.face_edge.has_interior {
+            if edge.edge.has_interior {
                 tracker.test_edge(
-                    edge.face_edge.shape_id,
-                    &edge.face_edge.v0,
-                    &edge.face_edge.v1,
+                    edge.edge.shape_id,
+                    &edge.edge.v0,
+                    &edge.edge.v1,
                 );
             }
         }
     }
 
     /// Counts the number of distinct shapes in edges plus containing shapes (Vec version).
-    fn count_shapes_vec(&self, edges: &[ClippedEdge], containing: &[u32]) -> usize {
+    fn count_shapes_vec(&self, edges: &[ClippedEdge<S>], containing: &[u32]) -> usize {
         let mut count = 0;
         let mut last_shape_id: Option<u32> = None;
         let mut containing_iter = containing.iter().peekable();
 
         for edge in edges {
-            let shape_id = edge.face_edge.shape_id;
+            let shape_id = edge.edge.shape_id;
 
             if last_shape_id != Some(shape_id) {
                 count += 1;
@@ -767,7 +723,7 @@ impl QuadtreeIndexBuilder {
 }
 
 // =============================================================================
-// QuadtreeIndex - The Built Index
+// Index - The Built Index
 // =============================================================================
 
 /// A built quadtree spatial index.
@@ -775,17 +731,17 @@ impl QuadtreeIndexBuilder {
 /// The index is immutable once built. For updates, create a new builder
 /// and rebuild the index.
 #[derive(Debug)]
-pub struct QuadtreeIndex {
-    /// Global coordinate bounds.
-    bounds: Bounds,
+pub struct Index<S: Surface> {
+    /// Surface.
+    surface: S,
 
     /// Index cells, keyed by cell ID (in Z-order).
-    cells: BTreeMap<QuadtreeCellId, QuadtreeCell>,
+    cells: BTreeMap<S::CellId, Cell<S::CellId>>,
 }
 
-impl QuadtreeIndex {
+impl<S: Surface> Index<S> {
     /// Returns the global bounds.
-    pub fn bounds(&self) -> &Bounds {
+    pub fn bounds(&self) -> &Rect {
         &self.bounds
     }
 
@@ -800,14 +756,14 @@ impl QuadtreeIndex {
     }
 
     /// Returns the cell for the given cell ID, if it exists.
-    pub fn get_cell(&self, id: QuadtreeCellId) -> Option<&QuadtreeCell> {
+    pub fn get_cell(&self, id: S::CellId) -> Option<&S::CellId> {
         self.cells.get(&id)
     }
 
     /// Finds the cell containing the given point.
     ///
     /// Returns the most specific (deepest) cell that contains the point.
-    pub fn locate_point(&self, point: &Point2D) -> Option<&QuadtreeCell> {
+    pub fn locate_point(&self, point: &S::Point) -> Option<&S::CellId> {
         // FIX: Use from_xy instead of non-existent from_point
         let target =
             QuadtreeCellId::from_xy(point.x, point.y, QuadtreeCellId::MAX_LEVEL, &self.bounds);
@@ -828,7 +784,7 @@ impl QuadtreeIndex {
     }
 
     /// Returns an iterator over all cells in Z-order.
-    pub fn cells(&self) -> impl Iterator<Item = (&QuadtreeCellId, &QuadtreeCell)> {
+    pub fn cells(&self) -> impl Iterator<Item = (&S::CellId, &Cell<S::CellId>)> {
         self.cells.iter()
     }
 
@@ -837,14 +793,14 @@ impl QuadtreeIndex {
     pub fn cells_intersecting(
         &self,
         query_bounds: &Rect,
-    ) -> impl Iterator<Item = &QuadtreeCell> + '_ {
+    ) -> impl Iterator<Item = &Cell<S::CellId>> + '_ {
         // Copy the Rect (it implements Copy) to avoid lifetime issues
         let query = *query_bounds;
         // For now, simple implementation that filters all cells
         // A more efficient implementation would use the tree structure
         self.cells.values().filter(move |cell| {
-            let cell_bounds = cell.cell_id().to_bounds(&self.bounds);
-            cell_bounds.intersects(&query)
+            let cell_rect = self.surface.cell_to_rect(cell.cell_id());
+            cell_rect.intersects(&query)
         })
     }
 

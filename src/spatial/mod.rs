@@ -1,6 +1,8 @@
 //! Spatial module (implements a block kd-tree)
 
+pub mod clipped_shape;
 pub mod surface;
+pub mod builder;
 pub mod interior_tracker;
 pub mod bitshuffle;
 pub mod bvh;
@@ -15,5 +17,12 @@ pub mod reader;
 pub mod serializer;
 pub mod spatial_index_manager;
 pub mod view;
+pub mod cell;
 pub mod writer;
 pub mod xor;
+pub mod padded_cell;
+pub mod merge;
+
+pub use padded_cell::PaddedCell;
+pub use clipped_shape::ClippedShape;
+pub use cell::Cell;

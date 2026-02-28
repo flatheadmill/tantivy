@@ -1,7 +1,7 @@
 //! HUSH
 
 use crate::spatial::quadtree::{
-    brute_force_contains_2d, Bounds, EdgeCrosser2D, Point2D, QuadtreeCellId,
+    brute_force_contains_2d, Rect, EdgeCrosser2D, Point2D, QuadtreeCellId,
 };
 
 #[derive(Debug)]
@@ -37,7 +37,7 @@ impl InteriorTracker {
     ///
     /// The origin is placed at (bounds.min_x - 1, bounds.min_y - 1) to ensure
     /// it is outside all shapes indexed within the bounds.
-    pub fn new(bounds: &Bounds) -> Self {
+    pub fn new(bounds: &Rect) -> Self {
         let origin = Point2D::new(bounds.min_x - 1.0, bounds.min_y - 1.0);
         let next_cellid = QuadtreeCellId::begin(QuadtreeCellId::MAX_LEVEL);
 
@@ -154,7 +154,6 @@ impl InteriorTracker {
     pub fn at_cellid(&self, cellid: QuadtreeCellId) -> bool {
         cellid.range_min() == self.next_cellid
     }
-
     /// Sets the partial shape ID.
     #[inline]
     pub fn set_partial_shape_id(&mut self, shape_id: i32) {
