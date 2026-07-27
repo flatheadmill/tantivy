@@ -17,7 +17,7 @@ use super::s2padded_cell::S2PaddedCell;
 use super::surface::Surface;
 use crate::spatial::clip_options::ClipOptions;
 use crate::spatial::clipped_shape::{ClippedShape, GeometryId};
-use crate::spatial::clipper::{get_level_for_max_value, CELL_SIZE_TO_LONG_EDGE_RATIO};
+use crate::spatial::clipper::get_edge_max_level;
 use crate::spatial::r1interval::R1Interval;
 use crate::spatial::shape_index::ShapeCell;
 
@@ -114,9 +114,7 @@ impl<S: Surface> SpongeCell<S> {
                         if !clip_edge_bound(a_uv, b_uv, &self.cell_bound, &mut bound) {
                             continue;
                         }
-                        let length = S::edge_length(&v0, &v1);
-                        let max_level =
-                            get_level_for_max_value(length * CELL_SIZE_TO_LONG_EDGE_RATIO);
+                        let max_level = get_edge_max_level::<S>(&v0, &v1);
                         self.edge_count += 1;
                         if self.cell_id.level() < max_level {
                             self.short_edge_count += 1;
