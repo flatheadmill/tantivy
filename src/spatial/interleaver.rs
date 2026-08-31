@@ -366,9 +366,6 @@ impl<'a, S: Surface> Iterator for Interleaver<'a, S> {
                 self.push_next_from_source(*source);
             }
             if let Some(entry) = self.heap.pop() {
-                if let HeapEntry::Source { source, .. } = &entry {
-                    self.push_next_from_source(*source);
-                }
                 if sponge.cell_id().contains(entry.cell_id()) || sponge.cell_id() == entry.cell_id()
                 {
                     self.absorptions += 1;
@@ -390,9 +387,10 @@ impl<'a, S: Surface> Iterator for Interleaver<'a, S> {
                             merged.absorb_sponge_cell_edges(entry_merged);
                             merged.absorb_sponge_cell_anchors(entry_merged);
                         }
-                        HeapEntry::Source { cell, .. } => {
+                        HeapEntry::Source { source, cell } => {
                             merged.absorb_index_cell_anchors(cell, self.edge_cache);
                             merged.absorb_index_cell_edges(cell, self.edge_cache);
+                            self.push_next_from_source(*source);
                         }
                     }
                     if merged.edge_count <= self.max_edges {
