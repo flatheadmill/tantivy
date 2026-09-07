@@ -25,6 +25,7 @@ pub mod covering;
 pub mod crossings;
 pub mod delta;
 pub mod distance;
+mod distance_boundary;
 pub mod edge_cache;
 pub mod edge_crosser;
 pub mod edge_provider;

@@ -42,22 +42,16 @@ impl<S: Surface> Ord for CoveringCell<S> {
     }
 }
 
-/// Subdivide a covering cell into four children. Distributes query edge indices into child
-/// quadrants using UV bounds. Computes index ranges from the parent range. Children inherit the
-/// parent's contains_center; call covering_contains_center afterward to update via crossings.
-/// Discards exterior children (no query edges and not interior) and empty ranges.
-pub(crate) fn covering_split<S: Surface>(
-    entry: &CoveringCell<S>,
+/// Distribute query edges among the four padded child quadrants. The distance flood needs
+/// boundary cells even where the index is empty, so this step does not check index ranges.
+pub(crate) fn split_edges<S: Surface>(
+    pcell: &S2PaddedCell<S>,
+    edges: &[u32],
     get_edge: &impl Fn(u32) -> (S::Point, S::Point),
-    start_for_cell: &impl Fn(S2CellId, u32, u32) -> (u32, i32),
-) -> Vec<CoveringCell<S>> {
-    if entry.pcell.id().is_leaf() {
-        return vec![];
-    }
-
-    let face = entry.pcell.id().face();
-    let cell_bound = entry.pcell.bound();
-    let middle = entry.pcell.middle();
+) -> [[Vec<u32>; 2]; 2] {
+    let face = pcell.id().face();
+    let cell_bound = pcell.bound();
+    let middle = pcell.middle();
     let u_mid_lo = middle[0].lo();
     let u_mid_hi = middle[0].hi();
     let v_mid_lo = middle[1].lo();
@@ -65,7 +59,7 @@ pub(crate) fn covering_split<S: Surface>(
 
     let mut child_edges: [[Vec<u32>; 2]; 2] = Default::default();
 
-    for &edge_idx in &entry.query_edges {
+    for &edge_idx in edges {
         let (v0, v1) = get_edge(edge_idx);
         let (a_uv, b_uv) = match S::clip_to_face(&v0, &v1, face, S::CELL_PADDING) {
             Some(ab) => ab,
@@ -88,6 +82,24 @@ pub(crate) fn covering_split<S: Surface>(
             child_edges[1][1].push(edge_idx);
         }
     }
+
+    child_edges
+}
+
+/// Subdivide a covering cell into four children. Distributes query edge indices into child
+/// quadrants using UV bounds. Computes index ranges from the parent range. Children inherit the
+/// parent's contains_center; call covering_contains_center afterward to update via crossings.
+/// Discards exterior children (no query edges and not interior) and empty ranges.
+pub(crate) fn covering_split<S: Surface>(
+    entry: &CoveringCell<S>,
+    get_edge: &impl Fn(u32) -> (S::Point, S::Point),
+    start_for_cell: &impl Fn(S2CellId, u32, u32) -> (u32, i32),
+) -> Vec<CoveringCell<S>> {
+    if entry.pcell.id().is_leaf() {
+        return vec![];
+    }
+
+    let mut child_edges = split_edges(&entry.pcell, &entry.query_edges, get_edge);
 
     let mut child_ij: [(usize, usize); 4] = [(0, 0); 4];
     let mut child_ids: [S2CellId; 4] = [S2CellId(0); 4];

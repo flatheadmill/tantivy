@@ -3,6 +3,10 @@
 //! Evaluates multi-stage spatial queries during Weight construction, producing per-segment
 //! bitsets or scored result sets that per-segment scorers iterate.
 
+#[cfg(test)]
+#[path = "tests/executor_tests.rs"]
+mod tests;
+
 use std::collections::HashMap;
 use std::fmt;
 
@@ -136,7 +140,11 @@ fn evaluate(
                 let mut bitset = BitSet::with_max_value(reader.max_doc());
                 let mut doc = scorer.doc();
                 while doc != TERMINATED {
-                    bitset.insert(doc);
+                    // A deleted inner geometry can make a live outer document match a join.
+                    // Exclude it here, before the join runs.
+                    if !reader.is_deleted(doc) {
+                        bitset.insert(doc);
+                    }
                     doc = scorer.advance();
                 }
                 results.insert(reader.segment_id(), SegmentResult::Match(bitset));

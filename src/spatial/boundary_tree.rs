@@ -138,8 +138,12 @@ impl BoundaryTree {
 
 #[inline]
 fn chord_angle(a: &[f64; 3], b: &[f64; 3]) -> f64 {
-    let dot = a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-    2.0 - 2.0 * dot
+    // Compute squared chord length from coordinate differences, as the split-axis bound does.
+    // The 2 - 2 * dot form can round below zero for nearby points and prune a closer subtree.
+    let dx = a[0] - b[0];
+    let dy = a[1] - b[1];
+    let dz = a[2] - b[2];
+    dx * dx + dy * dy + dz * dz
 }
 
 #[cfg(test)]
@@ -155,7 +159,7 @@ mod tests {
     }
 
     #[test]
-    fn nearest_finds_closest() {
+    fn test_nearest_finds_closest() {
         let nodes = vec![
             node(1.0, 0.0, 0.0),
             node(0.0, 1.0, 0.0),
@@ -170,7 +174,7 @@ mod tests {
     }
 
     #[test]
-    fn search_within_finds_all() {
+    fn test_search_within_finds_all() {
         let nodes = vec![
             node(1.0, 0.0, 0.0),
             node(0.0, 1.0, 0.0),
@@ -187,7 +191,7 @@ mod tests {
     }
 
     #[test]
-    fn search_within_prunes() {
+    fn test_search_within_prunes() {
         let nodes = vec![node(1.0, 0.0, 0.0), node(-1.0, 0.0, 0.0)];
         let tree = BoundaryTree::build(nodes);
         let query = [1.0, 0.0, 0.0];
@@ -200,7 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn search_within_early_termination() {
+    fn test_search_within_early_termination() {
         let nodes = vec![
             node(1.0, 0.0, 0.0),
             node(0.0, 1.0, 0.0),
@@ -217,7 +221,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_tree() {
+    fn test_empty_tree() {
         let tree = BoundaryTree::build(vec![]);
         assert!(tree.nearest(&[1.0, 0.0, 0.0]).is_none());
         let mut count = 0;
@@ -226,5 +230,44 @@ mod tests {
             true
         });
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_nearby_cell_centers_keep_their_distance() {
+        use crate::spatial::s2cell_id::S2CellId;
+        use crate::spatial::sphere::Sphere;
+        use crate::spatial::surface::Surface;
+
+        let query = Sphere::cell_center(S2CellId(0x0ffc66deb41def00));
+        let points = [
+            Sphere::cell_center(S2CellId(0x0ffc66deb41df100)),
+            Sphere::cell_center(S2CellId(0x0ffc66deb41de500)),
+        ];
+        let tree = BoundaryTree::build(
+            points
+                .iter()
+                .enumerate()
+                .map(|(i, &point)| BoundaryNode {
+                    point,
+                    edge_indices: vec![i as u32],
+                })
+                .collect(),
+        );
+        let distances = points.map(|p| {
+            p.iter()
+                .zip(query)
+                .map(|(a, b)| (a - b) * (a - b))
+                .sum::<f64>()
+        });
+        assert!(distances[1] > 0.0 && distances[1] < distances[0]);
+        let (distance, nearest) = tree.nearest(&query).unwrap();
+        assert_eq!(nearest.edge_indices, [1]);
+        assert_eq!(distance, distances[1]);
+        let mut found = Vec::new();
+        tree.search_within(&query, (distances[0] + distances[1]) / 2.0, &mut |edges| {
+            found.extend_from_slice(edges);
+            true
+        });
+        assert_eq!(found, [1]);
     }
 }

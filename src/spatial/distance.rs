@@ -1,18 +1,19 @@
-//! Distance query: find indexed geometries within a distance of the query polygon.
+//! Find indexed geometries within a distance of the query geometry.
 //!
-//! At distance zero this is equivalent to intersects. At distance D it finds all geometries whose
-//! edges are within D of the query polygon's edges. Uses the query CellIndex for the polygon
-//! interior (intersects phase) and a flood fill with kd-tree pruning for the distance band around
-//! the boundary.
+//! A covering descent searches the query interior, and a flood at one cell level searches
+//! around its boundary. Index cells can be larger than flood cells, so a cell overlap only
+//! identifies candidates. Containment and edge distances determine which geometries match.
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashSet};
 
 use common::BitSet;
 
-use super::boundary_tree::{BoundaryNode, BoundaryTree};
 use super::cell_index_reader::CellIndexReader;
-use super::covering::{covering_contains_center, covering_split, CoveringCell};
+use super::clip_options::ClipOptions;
+use super::clipper::Clipper;
+use super::covering::{split_edges, CoveringCell};
+use super::distance_boundary::{xyz, DistanceBoundary};
 use super::edge_cache::EdgeCache;
 use super::edge_crosser::EdgeCrosser;
 use super::edge_provider::EdgeProvider;
@@ -20,25 +21,23 @@ use super::geometry_set::GeometrySet;
 use super::query_edge_provider::QueryEdgeProvider;
 use super::region_coverer::CovererOptions;
 use super::s1chord_angle::S1ChordAngle;
-use super::s2cell::S2Cell;
 use super::s2cell_id::S2CellId;
 use super::s2edge_distances::update_edge_pair_min_distance;
 use super::s2padded_cell::S2PaddedCell;
+use super::shape_index::{ShapeCell, ShapeIndex};
 use super::shape_index_region::index_contains_point;
 use super::surface::Surface;
-use crate::spatial::clip_options::ClipOptions;
-use crate::spatial::clipper::Clipper;
-use crate::spatial::shape_index::ShapeIndex;
 
 /// A sweep cell in the flood fill priority queue.
 struct SweepEntry {
     chord_to_nearest: f64,
     cell_id: S2CellId,
+    search_threshold: f64,
 }
 
 impl PartialEq for SweepEntry {
     fn eq(&self, other: &Self) -> bool {
-        self.chord_to_nearest == other.chord_to_nearest
+        self.cmp(other) == Ordering::Equal
     }
 }
 impl Eq for SweepEntry {}
@@ -53,42 +52,123 @@ impl Ord for SweepEntry {
     fn cmp(&self, other: &Self) -> Ordering {
         other
             .chord_to_nearest
-            .partial_cmp(&self.chord_to_nearest)
-            .unwrap_or(Ordering::Equal)
+            .total_cmp(&self.chord_to_nearest)
+            .then_with(|| other.cell_id.cmp(&self.cell_id))
     }
 }
 
-/// Prepared distance query, built once from a query polygon and applied per-segment.
+struct Matches {
+    seen: BitSet,
+    containment_tested: BitSet,
+    doc_ids: BitSet,
+}
+
+/// Prepared distance query, built once from query geometry and applied per segment.
 pub struct Distance<S: Surface> {
     query_index: ShapeIndex,
     query_edges: QueryEdgeProvider<S>,
-    max_distance: f64,
+    // Each edge has a member number and a vertex offset within that member. Ring gaps are skipped.
+    edges: Vec<(u32, u32)>,
+    edge_ids: Vec<Vec<u32>>,
+    boundary: Option<DistanceBoundary>,
+    max_distance: Option<S1ChordAngle>,
     first_only: bool,
 }
 
 impl<S: Surface> Distance<S> {
-    /// Build the query from a smashed GeometrySet. Distance is in radians on the sphere or in UV
-    /// units on the plane.
+    /// Build the query from a smashed GeometrySet. Distance is in radians.
+    /// Nonpositive values and NaN select the intersection path. Positive values are capped at PI.
+    /// Panics if a positive distance is requested on the plane.
     pub fn new(set: GeometrySet<S>, max_distance: f64, _options: CovererOptions) -> Self {
-        let builder = Clipper::new(ClipOptions::default());
-        let query_index = builder.build(std::slice::from_ref(&set));
+        let query_index = Clipper::new(ClipOptions::default()).build(std::slice::from_ref(&set));
+        let mut edges = Vec::new();
+        let mut edge_ids = Vec::new();
+        for (member_id, member) in set.members.iter().enumerate() {
+            let mut ids = vec![u32::MAX; member.vertices.len()];
+            for ring in member.ring_offsets.windows(2) {
+                let start = ring[0];
+                let end = ring[1];
+                let edge_end = if end == start + 1 {
+                    end
+                } else {
+                    end.saturating_sub(1)
+                };
+                for edge in start..edge_end {
+                    ids[edge] = edges.len() as u32;
+                    edges.push((member_id as u32, edge as u32));
+                }
+            }
+            edge_ids.push(ids);
+        }
         let query_edges = QueryEdgeProvider { set };
+        let max_distance = (max_distance > 0.0)
+            .then(|| S1ChordAngle::from_radians(max_distance.min(std::f64::consts::PI)));
+        let boundary = max_distance.map(|distance| {
+            assert_eq!(
+                S::DIMENSIONS,
+                3,
+                "positive planar distance is not implemented"
+            );
+            let seeds = query_index.cells.iter().map(|cell| {
+                let ids = cell
+                    .shapes
+                    .iter()
+                    .flat_map(|shape| {
+                        let member = shape.geometry_id.1 as usize;
+                        let ids = &edge_ids[member];
+                        shape
+                            .edge_indices
+                            .iter()
+                            .map(move |&edge| ids[edge as usize])
+                    })
+                    .collect();
+                (cell.cell_id, ids)
+            });
+            DistanceBoundary::build::<S>(distance, seeds, &|id| {
+                let (member, edge) = edges[id as usize];
+                query_edges.get_edge((0, member), edge)
+            })
+        });
         Self {
             query_index,
             query_edges,
+            edges,
+            edge_ids,
+            boundary,
             max_distance,
             first_only: false,
         }
     }
 
-    /// Build a boolean distance query that returns after the first hit.
+    /// Build a distance query that stops after the first matching document.
     pub fn any_within(set: GeometrySet<S>, max_distance: f64, options: CovererOptions) -> Self {
-        let mut q = Self::new(set, max_distance, options);
-        q.first_only = true;
-        q
+        let mut query = Self::new(set, max_distance, options);
+        query.first_only = true;
+        query
     }
 
-    /// Search one segment for geometries within max_distance of the query polygon.
+    fn edge(&self, id: u32) -> (S::Point, S::Point) {
+        let (member, edge) = self.edges[id as usize];
+        self.query_edges.get_edge((0, member), edge)
+    }
+
+    fn member_contains(&self, member: u32, point: &S::Point) -> bool {
+        self.query_edges.set.members[member as usize].closed
+            && index_contains_point::<S, _>(
+                &self.query_index,
+                &self.query_edges,
+                (0, member),
+                point,
+            )
+    }
+
+    fn contains(&self, point: &S::Point) -> bool {
+        (0..self.query_edges.set.members.len() as u32)
+            .any(|member| self.member_contains(member, point))
+    }
+
+    /// Search one segment. The caller must exclude deleted documents through terms_filter,
+    /// since their geometry may still be present in the spatial files.
     pub fn search<'a>(
         &self,
         reader: &'a CellIndexReader<'a>,
@@ -97,529 +177,274 @@ impl<S: Surface> Distance<S> {
         max_doc: u32,
     ) -> BitSet {
         let geometry_count = edge_cache.geometry_count(0);
-        let mut seen = BitSet::with_max_value(geometry_count);
-        let mut doc_ids = BitSet::with_max_value(max_doc);
-        let mut containment_tested = BitSet::with_max_value(geometry_count);
-        let mut boundary_entries: Vec<(S2CellId, Vec<u32>)> = Vec::new();
+        let mut matches = Matches {
+            seen: BitSet::with_max_value(geometry_count),
+            containment_tested: BitSet::with_max_value(geometry_count),
+            doc_ids: BitSet::with_max_value(max_doc),
+        };
+        if reader.cell_count() == 0 || terms_filter.is_some_and(|filter| filter.len() == 0) {
+            return matches.doc_ids;
+        }
 
-        // We perform intersection since it is equivalent to within distance according to
-        // ST_DWithin.
-        for query_edge_set in &self.query_edges.set.members {
-            let query_vertex = &query_edge_set.vertices[0];
-            let query_point_cell_id = S::cell_id_from_point(query_vertex);
-            if let Some(qpc) = reader.find(query_point_cell_id) {
-                let cell_center = S::cell_center(qpc.cell_id);
-                for shape in &qpc.shapes {
+        // A candidate containing a query component need not have an edge in the query region.
+        for member in &self.query_edges.set.members {
+            let Some(query_vertex) = member.vertices.first() else {
+                continue;
+            };
+            if let Some(cell) = reader.find(S::cell_id_from_point(query_vertex)) {
+                let center = S::cell_center(cell.cell_id);
+                for shape in &cell.shapes {
                     let gid = shape.geometry_id.1;
+                    if matches.seen.contains(gid) {
+                        continue;
+                    }
                     let located = edge_cache.locate(shape.geometry_id);
+                    if terms_filter.is_some_and(|filter| !filter.contains(located.doc_id)) {
+                        matches.seen.insert(gid);
+                        continue;
+                    }
                     if !located.closed {
                         continue;
                     }
-                    if let Some(filter) = terms_filter {
-                        if !filter.contains(located.doc_id) {
-                            seen.insert(gid);
-                            continue;
-                        }
-                    }
                     let mut inside = shape.contains_center;
-                    if !shape.edge_indices.is_empty() {
-                        let mut crosser = S::EdgeCrosser::new(&cell_center, query_vertex);
-                        for &edge_idx in &shape.edge_indices {
-                            let (v0, v1) = located.edge(edge_idx);
-                            if crosser.edge_or_vertex_crossing_two(&v0, &v1) {
-                                inside = !inside;
-                            }
+                    let mut crosser = S::EdgeCrosser::new(&center, query_vertex);
+                    for &edge in &shape.edge_indices {
+                        let (a, b) = located.edge(edge);
+                        inside ^= crosser.edge_or_vertex_crossing_two(&a, &b);
+                    }
+                    if inside {
+                        matches.seen.insert(gid);
+                        matches.doc_ids.insert(located.doc_id);
+                        if self.first_only {
+                            return matches.doc_ids;
                         }
-                    }
-                    if !inside {
-                        continue;
-                    }
-                    seen.insert(gid);
-                    doc_ids.insert(located.doc_id);
-                    if self.first_only {
-                        return doc_ids;
                     }
                 }
             }
         }
 
+        // Keep covering entries separate for each member. Counting crossings across members
+        // together would exclude points inside two overlapping polygons.
         let mut heap = BinaryHeap::new();
-
-        for query_cell in &self.query_index.cells {
-            let cell_id = query_cell.cell_id;
-
-            let mut query_edge_indices: Vec<u32> = Vec::new();
-            let mut contains_center = false;
-            for shape in &query_cell.shapes {
-                query_edge_indices.extend_from_slice(&shape.edge_indices);
-                if shape.contains_center {
-                    contains_center = true;
-                }
-            }
-
-            let (index_start, index_end) = reader.range_for_cell(cell_id, 0, reader.cell_count());
-
-            if index_start == index_end && query_edge_indices.is_empty() && !contains_center {
+        for cell in &self.query_index.cells {
+            let (start, end) = reader.range_for_cell(cell.cell_id, 0, reader.cell_count());
+            if start == end {
                 continue;
             }
-
-            let first_index_level = if index_start < index_end {
-                reader.cell_id_at(index_start).level()
-            } else {
-                0
-            };
-
-            heap.push(CoveringCell {
-                pcell: S2PaddedCell::new(cell_id, S::CELL_PADDING),
-                query_edges: query_edge_indices,
-                contains_center,
-                index_start,
-                index_end,
-                first_index_level,
-            });
+            for shape in &cell.shapes {
+                let member = shape.geometry_id.1;
+                heap.push((
+                    CoveringCell {
+                        pcell: S2PaddedCell::<S>::new(cell.cell_id, S::CELL_PADDING),
+                        query_edges: shape
+                            .edge_indices
+                            .iter()
+                            .map(|&edge| self.edge_ids[member as usize][edge as usize])
+                            .collect(),
+                        contains_center: shape.contains_center,
+                        index_start: start,
+                        index_end: end,
+                        first_index_level: reader.cell_id_at(start).level(),
+                    },
+                    member,
+                ));
+            }
         }
 
-        let mut found = false;
-
-        while let Some(entry) = heap.pop() {
-            if self.first_only && found {
-                break;
-            }
-            if entry.query_edges.is_empty()
-                && entry.contains_center
-                && entry.first_index_level > entry.pcell.level()
-            {
-                if !reader.doc_ids_data.is_empty() && terms_filter.is_none() {
-                    if self.first_only && entry.index_start < entry.index_end {
-                        found = true;
+        while let Some((entry, member)) = heap.pop() {
+            if !entry.query_edges.is_empty() && entry.pcell.level() < entry.first_index_level {
+                let mut children =
+                    split_edges(&entry.pcell, &entry.query_edges, &|id| self.edge(id));
+                for pos in 0..4 {
+                    let (i, j) = entry.pcell.get_child_ij(pos);
+                    let pcell = S2PaddedCell::from_parent(&entry.pcell, i, j);
+                    let (start, end) =
+                        reader.range_for_cell(pcell.id(), entry.index_start, entry.index_end);
+                    if start == end {
                         continue;
                     }
-                    reader.visit_doc_ids(entry.index_start, entry.index_end, |doc_id| {
-                        doc_ids.insert(doc_id);
-                        true
-                    });
-                } else if self.first_only && !reader.doc_ids_data.is_empty() {
-                    let filter = terms_filter.unwrap();
-                    reader.visit_doc_ids(entry.index_start, entry.index_end, |doc_id| {
-                        if filter.contains(doc_id) {
-                            found = true;
-                            return false;
-                        }
-                        true
-                    });
-                } else {
-                    for pos in entry.index_start..entry.index_end {
-                        let cell = reader.cell_at(pos);
-                        for clipped in &cell.shapes {
-                            let gid = clipped.geometry_id.1;
-                            if seen.contains(gid) {
-                                continue;
-                            }
-                            seen.insert(gid);
-                            let doc_id = edge_cache.doc_id_for(clipped.geometry_id);
-                            if let Some(filter) = terms_filter {
-                                if !filter.contains(doc_id) {
-                                    continue;
-                                }
-                            }
-                            doc_ids.insert(doc_id);
-                        }
+                    let query_edges = std::mem::take(&mut children[i][j]);
+                    // A child can be inside the polygon even when its parent's center is outside.
+                    // Check the child's center before discarding a child without edges.
+                    let contains_center = self.member_contains(member, &pcell.get_center());
+                    if query_edges.is_empty() && !contains_center {
+                        continue;
                     }
-                }
-            } else if entry.pcell.level() < entry.first_index_level && !entry.pcell.id().is_leaf() {
-                let get_edge = |idx: u32| self.query_edges.get_edge((0, 0), idx);
-                let start_for_cell = |cell_id: S2CellId, lo: u32, hi: u32| {
-                    let start = reader.start_for_cell(cell_id, lo, hi);
-                    let level = if start < hi {
-                        reader.cell_id_at(start).level()
-                    } else {
-                        0
-                    };
-                    (start, level)
-                };
-                let parent_center = entry.pcell.get_center();
-                let mut children = covering_split(&entry, &get_edge, &start_for_cell);
-                covering_contains_center::<S>(&parent_center, &mut children, &get_edge);
-                for child in children {
-                    heap.push(child);
+                    heap.push((
+                        CoveringCell {
+                            pcell,
+                            query_edges,
+                            contains_center,
+                            index_start: start,
+                            index_end: end,
+                            first_index_level: reader.cell_id_at(start).level(),
+                        },
+                        member,
+                    ));
                 }
             } else {
-                if !entry.query_edges.is_empty() {
-                    boundary_entries.push((entry.pcell.id(), entry.query_edges.clone()));
-                }
-                let query_vertices = &self.query_edges.get_edge_set((0, 0)).vertices;
                 for pos in entry.index_start..entry.index_end {
-                    let cell = reader.cell_at(pos);
-                    for clipped in &cell.shapes {
-                        let gid = clipped.geometry_id.1;
-
-                        if seen.contains(gid) {
-                            continue;
-                        }
-
-                        let doc_id = edge_cache.doc_id_for(clipped.geometry_id);
-                        if let Some(filter) = terms_filter {
-                            if !filter.contains(doc_id) {
-                                seen.insert(gid);
-                                continue;
-                            }
-                        }
-
-                        if !containment_tested.contains(gid) {
-                            containment_tested.insert(gid);
-
-                            let located = edge_cache.locate(clipped.geometry_id);
-                            let first_vertex = located.vertex(0);
-                            if index_contains_point::<S, QueryEdgeProvider<S>>(
-                                &self.query_index,
-                                &self.query_edges,
-                                (0, 0),
-                                &first_vertex,
-                            ) {
-                                seen.insert(gid);
-                                doc_ids.insert(located.doc_id);
-                                if self.first_only {
-                                    return doc_ids;
-                                }
-                                continue;
-                            }
-                        }
-
-                        if !clipped.edge_indices.is_empty() && !entry.query_edges.is_empty() {
-                            let located = edge_cache.locate(clipped.geometry_id);
-                            if located.vertex_count >= 2 {
-                                let crossed = 'crossing: {
-                                    for &candidate_edge_idx in &clipped.edge_indices {
-                                        let (cv0, cv1) = located.edge(candidate_edge_idx);
-                                        let mut crosser = S::EdgeCrosser::new(&cv0, &cv1);
-                                        for &query_edge_idx in &entry.query_edges {
-                                            let qi = query_edge_idx as usize;
-                                            let qv0 = &query_vertices[qi];
-                                            let qv1 = &query_vertices[qi + 1];
-                                            if crosser.crossing_sign_two(qv0, qv1) > 0 {
-                                                break 'crossing true;
-                                            }
-                                        }
-                                    }
-                                    false
-                                };
-                                if crossed {
-                                    seen.insert(gid);
-                                    doc_ids.insert(doc_id);
-                                    if self.first_only {
-                                        return doc_ids;
-                                    }
-                                }
-                            }
-                        }
+                    if self.visit_cell(
+                        &reader.cell_at(pos),
+                        &entry.query_edges,
+                        terms_filter,
+                        edge_cache,
+                        &mut matches,
+                    ) {
+                        return matches.doc_ids;
                     }
                 }
             }
         }
 
-        if self.first_only && found {
-            return doc_ids;
+        if let Some(boundary) = &self.boundary {
+            self.flood_fill(boundary, reader, terms_filter, edge_cache, &mut matches);
         }
+        matches.doc_ids
+    }
 
-        // Phase 2: flood fill for the distance band.
-        if self.max_distance > 0.0 && !boundary_entries.is_empty() {
-            self.flood_fill(
-                &boundary_entries,
-                reader,
-                terms_filter,
-                edge_cache,
-                &mut seen,
-                &mut doc_ids,
-            );
+    /// Check candidate geometries for containment or an edge pair within the requested distance.
+    /// A stored cell may extend beyond the flood cell, so overlap alone cannot establish a match.
+    /// A failed check leaves the geometry eligible for later cells with different edge pairs.
+    fn visit_cell<'a>(
+        &self,
+        cell: &ShapeCell,
+        query_edges: &[u32],
+        terms_filter: Option<&BitSet>,
+        edge_cache: &mut EdgeCache<'a, S>,
+        matches: &mut Matches,
+    ) -> bool {
+        for clipped in &cell.shapes {
+            let gid = clipped.geometry_id.1;
+            if matches.seen.contains(gid) {
+                continue;
+            }
+            let located = edge_cache.locate(clipped.geometry_id);
+            if terms_filter.is_some_and(|filter| !filter.contains(located.doc_id)) {
+                matches.seen.insert(gid);
+                continue;
+            }
+            if matches.doc_ids.contains(located.doc_id) {
+                matches.seen.insert(gid);
+                continue;
+            }
+            if located.vertex_count == 0 {
+                continue;
+            }
+            let mut found = false;
+            if !matches.containment_tested.contains(gid) {
+                matches.containment_tested.insert(gid);
+                found = self.contains(&located.vertex(0));
+            }
+            if !found {
+                'pairs: for &candidate_edge in &clipped.edge_indices {
+                    let (a, b) = located.edge(candidate_edge);
+                    for &query_edge in query_edges {
+                        let (c, d) = self.edge(query_edge);
+                        if let Some(max_distance) = self.max_distance {
+                            let mut distance = S1ChordAngle::infinity();
+                            update_edge_pair_min_distance(
+                                &xyz(&a),
+                                &xyz(&b),
+                                &xyz(&c),
+                                &xyz(&d),
+                                &mut distance,
+                            );
+                            found = distance <= max_distance;
+                        } else {
+                            found = S::EdgeCrosser::new(&a, &b).crossing_sign_two(&c, &d) > 0;
+                        }
+                        if found {
+                            break 'pairs;
+                        }
+                    }
+                }
+            }
+            if found {
+                matches.seen.insert(gid);
+                matches.doc_ids.insert(located.doc_id);
+                if self.first_only {
+                    return true;
+                }
+            }
         }
-
-        doc_ids
+        false
     }
 
     fn flood_fill<'a>(
         &self,
-        boundary_entries: &[(S2CellId, Vec<u32>)],
+        boundary: &DistanceBoundary,
         reader: &'a CellIndexReader<'a>,
         terms_filter: Option<&BitSet>,
         edge_cache: &mut EdgeCache<'a, S>,
-        seen: &mut BitSet,
-        doc_ids: &mut BitSet,
+        matches: &mut Matches,
     ) {
-        let max_chord = S1ChordAngle::from_radians(self.max_distance).length2() as f64;
-
-        // Build the kd-tree from boundary cell centers.
-        let boundary_nodes: Vec<BoundaryNode> = boundary_entries
-            .iter()
-            .map(|(cell_id, edge_indices)| {
-                let center = S::cell_center(*cell_id);
-                let p = center.as_ref();
-                BoundaryNode {
-                    point: [p[0], p[1], p[2]],
-                    edge_indices: edge_indices.clone(),
-                }
-            })
-            .collect();
-        let boundary_tree = BoundaryTree::build(boundary_nodes);
-
-        // Compute the cell radius for the boundary level. All boundary cells are at the same level
-        // after the uniform split.
-        let boundary_level = boundary_entries[0].0.level();
-        let boundary_cell = S2Cell::new(boundary_entries[0].0);
-        let boundary_cap = boundary_cell.get_cap_bound();
-        let boundary_radius = boundary_cap.radius().length2() as f64;
-
-        // The search threshold accounts for both cell radii.
-        let search_threshold = max_chord + 2.0 * boundary_radius;
-
-        // Seed the flood fill with neighbors of boundary cells.
-        let mut visited: HashSet<S2CellId> = HashSet::new();
-        let mut flood_heap: BinaryHeap<SweepEntry> = BinaryHeap::new();
-
-        for (cell_id, _) in boundary_entries {
-            visited.insert(*cell_id);
+        let mut visited = HashSet::new();
+        let mut heap = BinaryHeap::new();
+        for &cell_id in &boundary.cells {
+            visited.insert(cell_id);
+            heap.push(SweepEntry {
+                chord_to_nearest: 0.0,
+                cell_id,
+                search_threshold: boundary.search_threshold::<S>(cell_id),
+            });
         }
-
-        // Seed the flood fill. For each boundary cell, visit its 8 neighbors. Neighbors that are
-        // within the search threshold (max distance plus cell radii) go onto the heap ordered by
-        // chord angle to the nearest boundary cell. The heap processes closest cells first so
-        // positives are found early. Each processed cell expands its own 8 neighbors, and the
-        // flood terminates when no reachable cell is within range.
-        for (cell_id, _) in boundary_entries {
-            let (_, i, j, _) = cell_id.to_face_ij_orientation();
-            let cell_size = S2CellId::size_ij_for_level(boundary_level);
-            for di in -1i32..=1 {
-                for dj in -1i32..=1 {
-                    if di == 0 && dj == 0 {
-                        continue;
-                    }
-                    let ni = i + di * cell_size;
-                    let nj = j + dj * cell_size;
-                    let neighbor =
-                        S2CellId::from_face_ij_wrap(cell_id.face(), ni, nj).parent(boundary_level);
-                    if !visited.insert(neighbor) {
-                        continue;
-                    }
-                    let center = S::cell_center(neighbor);
-                    let p = center.as_ref();
-                    let query = [p[0], p[1], p[2]];
-                    if let Some((chord, _)) = boundary_tree.nearest(&query) {
-                        if chord <= search_threshold {
-                            flood_heap.push(SweepEntry {
-                                chord_to_nearest: chord,
-                                cell_id: neighbor,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        let query_vertices = &self.query_edges.get_edge_set((0, 0)).vertices;
-
-        // Process the flood fill.
-        let mut flood_found = false;
-        while let Some(sweep) = flood_heap.pop() {
-            if self.first_only && flood_found {
-                return;
-            }
-            let sweep_cell = S2Cell::new(sweep.cell_id);
-            let sweep_cap = sweep_cell.get_cap_bound();
-            let sweep_radius = sweep_cap.radius().length2() as f64;
-
-            // Skip if definitely out of range.
-            if sweep.chord_to_nearest - sweep_radius - boundary_radius > max_chord {
-                continue;
-            }
-
-            // Bulk include if definitely in range.
-            let bulk_include = sweep.chord_to_nearest + sweep_radius + boundary_radius < max_chord;
-
-            // Look up index cells in this sweep cell.
-            let (index_start, index_end) =
-                reader.range_for_cell(sweep.cell_id, 0, reader.cell_count());
-
-            if bulk_include {
-                if self.first_only {
-                    if terms_filter.is_none() && index_start < index_end {
-                        flood_found = true;
-                        continue;
-                    }
-                    if let Some(filter) = terms_filter {
-                        if !reader.doc_ids_data.is_empty() {
-                            reader.visit_doc_ids(index_start, index_end, |doc_id| {
-                                if filter.contains(doc_id) {
-                                    flood_found = true;
-                                    return false;
-                                }
-                                true
-                            });
-                            continue;
-                        }
-                    }
-                }
-                if !reader.doc_ids_data.is_empty() && terms_filter.is_none() {
-                    reader.visit_doc_ids(index_start, index_end, |doc_id| {
-                        doc_ids.insert(doc_id);
+        let mut query_edges = Vec::new();
+        while let Some(sweep) = heap.pop() {
+            let center = xyz(&S::cell_center(sweep.cell_id));
+            let threshold = sweep.search_threshold;
+            let (start, end) = reader.range_for_cell(sweep.cell_id, 0, reader.cell_count());
+            if start != end {
+                query_edges.clear();
+                boundary
+                    .tree
+                    .search_within(&center, threshold, &mut |edges| {
+                        query_edges.extend_from_slice(edges);
                         true
                     });
-                } else {
-                    for pos in index_start..index_end {
-                        let cell = reader.cell_at(pos);
-                        for clipped in &cell.shapes {
-                            let gid = clipped.geometry_id.1;
-                            if seen.contains(gid) {
-                                continue;
-                            }
-                            seen.insert(gid);
-                            let doc_id = edge_cache.doc_id_for(clipped.geometry_id);
-                            if let Some(filter) = terms_filter {
-                                if !filter.contains(doc_id) {
-                                    continue;
-                                }
-                            }
-                            doc_ids.insert(doc_id);
-                        }
-                    }
-                }
-            } else {
-                // Drop down: edge-pair distance test.
-                let center = S::cell_center(sweep.cell_id);
-                let cp = center.as_ref();
-                let query_point = [cp[0], cp[1], cp[2]];
-
-                for pos in index_start..index_end {
-                    let cell = reader.cell_at(pos);
-                    for clipped in &cell.shapes {
-                        let gid = clipped.geometry_id.1;
-                        if seen.contains(gid) {
-                            continue;
-                        }
-
-                        let doc_id = edge_cache.doc_id_for(clipped.geometry_id);
-                        if let Some(filter) = terms_filter {
-                            if !filter.contains(doc_id) {
-                                seen.insert(gid);
-                                continue;
-                            }
-                        }
-
-                        let located = edge_cache.locate(clipped.geometry_id);
-                        if located.vertex_count < 2 && clipped.edge_indices.is_empty() {
-                            // Point geometry: test distance to nearest boundary edge.
-                            let v = located.vertex(0);
-                            let vp = v.as_ref();
-                            let vxyz: [f64; 3] =
-                                [vp[0], vp[1], if vp.len() > 2 { vp[2] } else { 0.0 }];
-                            let mut found = false;
-                            boundary_tree.search_within(
-                                &vxyz,
-                                search_threshold,
-                                &mut |edge_indices| {
-                                    for &qi in edge_indices {
-                                        let i = qi as usize;
-                                        let qv0 = &query_vertices[i];
-                                        let qv1 = &query_vertices[i + 1];
-                                        let q0 = qv0.as_ref();
-                                        let q1 = qv1.as_ref();
-                                        let q0xyz: [f64; 3] =
-                                            [q0[0], q0[1], if q0.len() > 2 { q0[2] } else { 0.0 }];
-                                        let q1xyz: [f64; 3] =
-                                            [q1[0], q1[1], if q1.len() > 2 { q1[2] } else { 0.0 }];
-                                        let mut dist = S1ChordAngle::infinity();
-                                        super::s2edge_distances::update_min_distance(
-                                            &vxyz, &q0xyz, &q1xyz, &mut dist,
-                                        );
-                                        if (dist.length2() as f64) <= max_chord {
-                                            found = true;
-                                            return false;
-                                        }
-                                    }
-                                    true
-                                },
-                            );
-                            if found {
-                                seen.insert(gid);
-                                doc_ids.insert(doc_id);
-                                if self.first_only {
-                                    return;
-                                }
-                            }
-                            continue;
-                        }
-
-                        // Edge geometry: test edge-pair distances.
-                        let mut found = false;
-                        boundary_tree.search_within(
-                            &query_point,
-                            search_threshold,
-                            &mut |edge_indices| {
-                                for &candidate_edge_idx in &clipped.edge_indices {
-                                    let (cv0, cv1) = edge_cache
-                                        .locate(clipped.geometry_id)
-                                        .edge(candidate_edge_idx);
-                                    let c0 = cv0.as_ref();
-                                    let c1 = cv1.as_ref();
-                                    let c0xyz: [f64; 3] =
-                                        [c0[0], c0[1], if c0.len() > 2 { c0[2] } else { 0.0 }];
-                                    let c1xyz: [f64; 3] =
-                                        [c1[0], c1[1], if c1.len() > 2 { c1[2] } else { 0.0 }];
-                                    for &qi in edge_indices {
-                                        let i = qi as usize;
-                                        let qv0 = &query_vertices[i];
-                                        let qv1 = &query_vertices[i + 1];
-                                        let q0 = qv0.as_ref();
-                                        let q1 = qv1.as_ref();
-                                        let q0xyz: [f64; 3] =
-                                            [q0[0], q0[1], if q0.len() > 2 { q0[2] } else { 0.0 }];
-                                        let q1xyz: [f64; 3] =
-                                            [q1[0], q1[1], if q1.len() > 2 { q1[2] } else { 0.0 }];
-                                        let mut dist = S1ChordAngle::infinity();
-                                        update_edge_pair_min_distance(
-                                            &c0xyz, &c1xyz, &q0xyz, &q1xyz, &mut dist,
-                                        );
-                                        if (dist.length2() as f64) <= max_chord {
-                                            found = true;
-                                            return false;
-                                        }
-                                    }
-                                }
-                                true
-                            },
-                        );
-                        if found {
-                            seen.insert(gid);
-                            doc_ids.insert(doc_id);
-                            if self.first_only {
-                                return;
-                            }
-                        }
+                query_edges.sort_unstable();
+                query_edges.dedup();
+                for pos in start..end {
+                    if self.visit_cell(
+                        &reader.cell_at(pos),
+                        &query_edges,
+                        terms_filter,
+                        edge_cache,
+                        matches,
+                    ) {
+                        return;
                     }
                 }
             }
 
-            // Expand neighbors.
+            // A shortest arc from the query to a point within D stays within D along its length.
+            // Every grid cell on that arc passes the distance bound, so the flood can reach it.
+            // The four edge neighbors maintain connectivity across cube faces. Wrapped diagonals
+            // may add extra cells at cube corners; visit_cell still checks their geometry.
             let (_, i, j, _) = sweep.cell_id.to_face_ij_orientation();
-            let cell_size = S2CellId::size_ij_for_level(boundary_level);
+            let size = S2CellId::size_ij_for_level(boundary.level);
             for di in -1i32..=1 {
                 for dj in -1i32..=1 {
                     if di == 0 && dj == 0 {
                         continue;
                     }
-                    let ni = i + di * cell_size;
-                    let nj = j + dj * cell_size;
-                    let neighbor = S2CellId::from_face_ij_wrap(sweep.cell_id.face(), ni, nj)
-                        .parent(boundary_level);
+                    let neighbor = S2CellId::from_face_ij_wrap(
+                        sweep.cell_id.face(),
+                        i + di * size,
+                        j + dj * size,
+                    )
+                    .parent(boundary.level);
                     if !visited.insert(neighbor) {
                         continue;
                     }
-                    let nc = S::cell_center(neighbor);
-                    let np = nc.as_ref();
-                    let nq = [np[0], np[1], np[2]];
-                    if let Some((chord, _)) = boundary_tree.nearest(&nq) {
+                    let center = xyz(&S::cell_center(neighbor));
+                    if let Some((chord, _)) = boundary.tree.nearest(&center) {
+                        let search_threshold = boundary.search_threshold::<S>(neighbor);
                         if chord <= search_threshold {
-                            flood_heap.push(SweepEntry {
+                            heap.push(SweepEntry {
                                 chord_to_nearest: chord,
                                 cell_id: neighbor,
+                                search_threshold,
                             });
                         }
                     }
@@ -628,3 +453,7 @@ impl<S: Surface> Distance<S> {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "tests/distance_tests.rs"]
+mod tests;
