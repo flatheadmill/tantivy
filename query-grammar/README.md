@@ -34,3 +34,7 @@ discarded. An empty group retained by lenient grammar recovery has the same
 meaning as an explicit empty AST. For example, `kind:park AND (open:)` reports
 a syntax error and matches nothing. A query builder given that recovered AST
 sees its empty child but cannot report the original grammar error.
+
+The [spatial query rewrite example](../examples/spatial_query_rewrite.rs) applies
+an ordinary predicate to the outermost query and every nested spatial input.
+Run it from the repository root with `cargo run --example spatial_query_rewrite`.
