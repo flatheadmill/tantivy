@@ -3,8 +3,8 @@ use std::ops::Bound;
 
 use tantivy::collector::{DocSetCollector, TopDocs};
 use tantivy::query::{
-    AllQuery, BooleanQuery, BoostQuery, EmptyQuery, Occur, Query, RangeQuery, SpatialPredicate,
-    SpatialQuery, TermQuery,
+    AllQuery, BooleanQuery, BoostQuery, EmptyQuery, Occur, Query, QueryParser, RangeQuery,
+    SpatialPredicate, SpatialQuery, TermQuery,
 };
 use tantivy::schema::{Field, IndexRecordOption, Schema, Value, INDEXED, SPHERE, STORED, STRING};
 use tantivy::spatial::executor::{PlanNode, SpatialExecutor, SpatialRelation};
@@ -324,6 +324,33 @@ fn test_join_keeps_boolean_score_contributions() -> tantivy::Result<()> {
         for (name, score) in scores {
             assert!(park_scores[&name] > 0.0);
             assert!((score - (park_scores[&name] + 1.0)).abs() < 1e-6);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_parser_builds_spatial_inner_queries() -> tantivy::Result<()> {
+    let fixture = Fixture::new(false)?;
+    let parser = QueryParser::for_index(fixture.searcher.index(), Vec::new());
+    for predicate in ["$within(1km, ", "$intersects("] {
+        let nested = format!(
+            "kind:park AND area:>=50 AND geometry:{predicate}$query(kind:trail AND \
+             geometry:{predicate}$query(kind:road AND open:true))))"
+        );
+        let empty = format!("geometry:{predicate}$query())");
+        for (text, expected) in [(nested, vec!["p_ok"]), (empty, Vec::new())] {
+            let ast = query_grammar::parse_query(&text).unwrap();
+            let from_text = parser.parse_query(&text).unwrap();
+            fixture.assert_names(from_text.as_ref(), &expected)?;
+            let from_ast = parser.build_query_from_user_input_ast(ast.clone()).unwrap();
+            fixture.assert_names(from_ast.as_ref(), &expected)?;
+            let (from_text, errors) = parser.parse_query_lenient(&text);
+            assert!(errors.is_empty(), "{errors:?}");
+            fixture.assert_names(from_text.as_ref(), &expected)?;
+            let (from_ast, errors) = parser.build_query_from_user_input_ast_lenient(ast);
+            assert!(errors.is_empty(), "{errors:?}");
+            fixture.assert_names(from_ast.as_ref(), &expected)?;
         }
     }
     Ok(())

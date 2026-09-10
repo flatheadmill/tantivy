@@ -48,8 +48,8 @@ pub enum UserInputLeaf {
             ordered_float::OrderedFloat<f64>,
             ordered_float::OrderedFloat<f64>,
         )>,
-        /// If set, this spatial predicate is a join. The string is the inner query text.
-        inner_query: Option<String>,
+        /// The inner query of a spatial join. Literal geometry has no inner query.
+        inner_query: Option<Box<UserInputAst>>,
     },
 }
 
@@ -157,7 +157,7 @@ impl Debug for UserInputLeaf {
                 field,
                 predicate,
                 coordinates,
-                inner_query: _,
+                inner_query,
             } => {
                 if let Some(field) = field {
                     write!(formatter, "\"{field}\":")?;
@@ -165,41 +165,31 @@ impl Debug for UserInputLeaf {
                 match predicate {
                     SpatialPredicateKind::Intersects => {
                         write!(formatter, "$intersects(")?;
-                        for (i, (lon, lat)) in coordinates.iter().enumerate() {
-                            if i > 0 {
-                                write!(formatter, ", ")?;
-                            }
-                            write!(formatter, "{} {}", lon.0, lat.0)?;
-                        }
-                        write!(formatter, ")")
                     }
                     SpatialPredicateKind::Contains => {
                         write!(formatter, "$contains(")?;
-                        for (i, (lon, lat)) in coordinates.iter().enumerate() {
-                            if i > 0 {
-                                write!(formatter, ", ")?;
-                            }
-                            write!(formatter, "{} {}", lon.0, lat.0)?;
-                        }
-                        write!(formatter, ")")
                     }
                     SpatialPredicateKind::Within(radius) => {
-                        let (lon, lat) = &coordinates[0];
-                        write!(formatter, "$within({}rad, {} {})", radius.0, lon.0, lat.0)
+                        write!(formatter, "$within({}rad, ", radius.0)?;
                     }
                     SpatialPredicateKind::Between(inner, outer) => {
-                        let (lon, lat) = &coordinates[0];
-                        write!(
-                            formatter,
-                            "$between({}rad, {}rad, {} {})",
-                            inner.0, outer.0, lon.0, lat.0
-                        )
+                        write!(formatter, "$between({}rad, {}rad, ", inner.0, outer.0)?;
                     }
                     SpatialPredicateKind::Knn(k) => {
-                        let (lon, lat) = &coordinates[0];
-                        write!(formatter, "$knn({}, {} {})", k, lon.0, lat.0)
+                        write!(formatter, "$knn({k}, ")?;
                     }
                 }
+                if let Some(inner) = inner_query {
+                    write!(formatter, "$query({inner:?})")?;
+                } else {
+                    for (i, (lon, lat)) in coordinates.iter().enumerate() {
+                        if i > 0 {
+                            write!(formatter, ", ")?;
+                        }
+                        write!(formatter, "{} {}", lon.0, lat.0)?;
+                    }
+                }
+                write!(formatter, ")")
             }
         }
     }
@@ -419,6 +409,50 @@ impl fmt::Debug for UserInputAst {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_spatial_inner_serialization() {
+        let join = UserInputLeaf::Spatial {
+            field: Some("geo".to_string()),
+            predicate: SpatialPredicateKind::Intersects,
+            coordinates: Vec::new(),
+            inner_query: Some(Box::new(UserInputAst::Boost(
+                Box::new(UserInputLeaf::All.into()),
+                2.0.into(),
+            ))),
+        };
+        assert_eq!(
+            serde_json::to_value(join).unwrap(),
+            serde_json::json!({
+                "type": "spatial",
+                "field": "geo",
+                "predicate": "intersects",
+                "coordinates": [],
+                "inner_query": {
+                    "type": "boost",
+                    "underlying": {"type": "all"},
+                    "boost": 2.0
+                }
+            })
+        );
+
+        let literal = UserInputLeaf::Spatial {
+            field: Some("geo".to_string()),
+            predicate: SpatialPredicateKind::Within(0.5.into()),
+            coordinates: vec![(1.0.into(), 2.0.into())],
+            inner_query: None,
+        };
+        assert_eq!(
+            serde_json::to_value(literal).unwrap(),
+            serde_json::json!({
+                "type": "spatial",
+                "field": "geo",
+                "predicate": {"within": 0.5},
+                "coordinates": [[1.0, 2.0]],
+                "inner_query": null
+            })
+        );
+    }
 
     #[test]
     fn test_all_leaf_serialization() {

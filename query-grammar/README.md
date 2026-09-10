@@ -1,3 +1,18 @@
 # Tantivy Query Grammar
 
 This crate is used by tantivy to parse queries.
+
+Spatial joins accept a query argument, for example
+`geometry:$within(1km, $query(kind:trail AND open:true))`. The `inner_query`
+field of `UserInputLeaf::Spatial` contains `Option<Box<UserInputAst>>`.
+Callers can inspect and modify that child before building an executable query.
+It is serialized as a nested AST object; earlier versions stored query text.
+Literal geometry has `inner_query: None`, serialized as `null`.
+
+Both parser entry points parse query arguments recursively. Strict parsing
+accepts whitespace between a function name and its opening parenthesis and
+rejects malformed spatial calls. Lenient parsing reports errors and preserves
+the inner query when its boundary can be identified. If invalid parameters or
+an unfinished expression prevent finding that boundary, it discards the
+malformed call and the remaining input. When only the call's closing parenthesis
+is missing after a complete query argument, later clauses can still be parsed.

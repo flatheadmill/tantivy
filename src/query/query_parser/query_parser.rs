@@ -385,6 +385,13 @@ impl QueryParser {
     fn parse_query_to_logical_ast(&self, query: &str) -> Result<LogicalAst, QueryParserError> {
         let user_input_ast = query_grammar::parse_query(query)
             .map_err(|_| QueryParserError::SyntaxError(query.to_string()))?;
+        self.compute_logical_ast(user_input_ast)
+    }
+
+    fn compute_logical_ast(
+        &self,
+        user_input_ast: UserInputAst,
+    ) -> Result<LogicalAst, QueryParserError> {
         let (ast, mut err) = self.compute_logical_ast_lenient(user_input_ast);
         if !err.is_empty() {
             return Err(err.swap_remove(0));
@@ -1014,7 +1021,7 @@ fn convert_literal_to_query(
             coordinates,
             inner_query,
         } => {
-            if let Some(inner_text) = inner_query {
+            if let Some(inner_ast) = inner_query {
                 let relation = match predicate {
                     SpatialPredicateKind::Intersects => SpatialRelation::Intersects,
                     SpatialPredicateKind::Contains => SpatialRelation::Contains,
@@ -1028,7 +1035,8 @@ fn convert_literal_to_query(
                     }
                 };
                 let inner_query = query_parser
-                    .parse_query(&inner_text)
+                    .compute_logical_ast(*inner_ast)
+                    .map(|ast| convert_to_query(fuzzy, ast, query_parser))
                     .unwrap_or(Box::new(EmptyQuery));
                 Box::new(SpatialExecutor::new(PlanNode::Join {
                     field,
