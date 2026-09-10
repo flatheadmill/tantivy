@@ -21,3 +21,11 @@ The grammar recognizes spatial syntax independently of execution support.
 Tantivy's query builder accepts distance and intersection joins, and literal
 distance, intersection, and containment predicates. Recognized but unimplemented
 predicates return `UnsupportedQuery` during resolution.
+
+An empty user AST matches no documents, including when it is a child of a
+Boolean group. This also applies to an empty `Clause` supplied directly to a
+query builder. Terms omitted during tokenization or query resolution are still
+discarded. An empty group retained by lenient grammar recovery has the same
+meaning as an explicit empty AST. For example, `kind:park AND (open:)` reports
+a syntax error and matches nothing. A query builder given that recovered AST
+sees its empty child but cannot report the original grammar error.

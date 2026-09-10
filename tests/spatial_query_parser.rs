@@ -755,3 +755,174 @@ fn test_parser_negative_roots_keep_existing_contract() -> tantivy::Result<()> {
     assert!(fixture.scores(&excluded)?.is_empty());
     Ok(())
 }
+
+#[test]
+fn test_parser_composes_empty_asts() -> tantivy::Result<()> {
+    use query_grammar::UserInputAst;
+
+    let fixture = Fixture::new(false)?;
+    let parser = QueryParser::for_index(fixture.searcher.index(), Vec::new());
+    let park = query_grammar::parse_query("kind:park").unwrap();
+    let empty = UserInputAst::empty_query();
+    let park_scores = fixture.scores(fixture.parks().as_ref())?;
+    let parks = ["p_band", "p_far", "p_hit", "p_ok", "p_small"];
+    let all = [
+        "n_hit", "p_band", "p_far", "p_hit", "p_ok", "p_small", "r_open", "t_closed", "t_open",
+    ];
+    let not_empty = empty.clone().unary(Occur::MustNot);
+    for (ast, expected) in [
+        (empty.clone(), [].as_slice()),
+        (
+            UserInputAst::Boost(Box::new(empty.clone()), 3.0.into()),
+            [].as_slice(),
+        ),
+        (
+            UserInputAst::and(vec![park.clone(), empty.clone()]),
+            [].as_slice(),
+        ),
+        (
+            UserInputAst::and(vec![empty.clone(), park.clone()]),
+            [].as_slice(),
+        ),
+        (
+            UserInputAst::or(vec![park.clone(), empty.clone()]),
+            parks.as_slice(),
+        ),
+        (
+            UserInputAst::or(vec![empty, park.clone()]),
+            parks.as_slice(),
+        ),
+        (
+            UserInputAst::and(vec![park.clone(), not_empty.clone()]),
+            parks.as_slice(),
+        ),
+        (
+            UserInputAst::or(vec![park.clone(), not_empty.clone()]),
+            all.as_slice(),
+        ),
+        (
+            UserInputAst::and(vec![park, not_empty.unary(Occur::MustNot)]),
+            [].as_slice(),
+        ),
+    ] {
+        let strict = parser.build_query_from_user_input_ast(ast.clone()).unwrap();
+        let (lenient, errors) = parser.build_query_from_user_input_ast_lenient(ast);
+        assert!(errors.is_empty(), "{errors:?}");
+        for query in [strict, lenient] {
+            fixture.assert_names(query.as_ref(), expected)?;
+            let scores = fixture.scores(query.as_ref())?;
+            assert_eq!(scores.len(), expected.len());
+            for name in expected {
+                let expected_score = park_scores.get(*name).copied().unwrap_or(0.0);
+                assert!((scores[*name] - expected_score).abs() < 1e-6);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_parser_keeps_empty_spatial_inputs() -> tantivy::Result<()> {
+    use query_grammar::{SpatialPredicateKind, UserInputAst, UserInputLeaf};
+
+    let fixture = Fixture::new(false)?;
+    let parser = QueryParser::for_index(fixture.searcher.index(), Vec::new());
+    for (predicate, text) in [
+        (
+            SpatialPredicateKind::Within(ONE_KM.into()),
+            "$within(1km, $query())",
+        ),
+        (SpatialPredicateKind::Intersects, "$intersects($query())"),
+    ] {
+        let text = format!("kind:park AND geometry:{text}");
+        for query in parser_queries(&parser, &text) {
+            fixture.assert_names(query.as_ref(), &[])?;
+        }
+        let inner = UserInputAst::and(vec![
+            query_grammar::parse_query("kind:trail").unwrap(),
+            UserInputAst::empty_query(),
+        ]);
+        let spatial = UserInputLeaf::Spatial {
+            field: Some("geometry".to_owned()),
+            predicate,
+            coordinates: Vec::new(),
+            inner_query: Some(Box::new(inner)),
+        };
+        let ast = UserInputAst::and(vec![
+            query_grammar::parse_query("kind:park").unwrap(),
+            spatial.into(),
+        ]);
+        let strict = parser.build_query_from_user_input_ast(ast.clone()).unwrap();
+        let (lenient, errors) = parser.build_query_from_user_input_ast_lenient(ast);
+        assert!(errors.is_empty(), "{errors:?}");
+        for query in [strict, lenient] {
+            fixture.assert_names(query.as_ref(), &[])?;
+            assert!(fixture.scores(query.as_ref())?.is_empty());
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_parser_retains_empty_groups_from_grammar_recovery() -> tantivy::Result<()> {
+    let fixture = Fixture::new(false)?;
+    let parser = QueryParser::for_index(fixture.searcher.index(), Vec::new());
+    let parks = ["p_band", "p_far", "p_hit", "p_ok", "p_small"];
+    let park_scores = fixture.scores(fixture.parks().as_ref())?;
+    for (text, position, expected) in [
+        ("kind:park AND (open:)", 20, [].as_slice()),
+        ("kind:park OR (open:)", 19, parks.as_slice()),
+        ("kind:park AND NOT ()", 19, parks.as_slice()),
+    ] {
+        let (ast, grammar_errors) = query_grammar::parse_query_lenient(text);
+        assert_eq!(grammar_errors.len(), 1);
+        assert_eq!(
+            parser.parse_query(text).unwrap_err(),
+            QueryParserError::SyntaxError(text.to_owned())
+        );
+        let (from_text, errors) = parser.parse_query_lenient(text);
+        assert_eq!(
+            errors,
+            [QueryParserError::SyntaxError(format!(
+                "expected word at position {position}"
+            ))]
+        );
+        let strict_ast = parser.build_query_from_user_input_ast(ast.clone()).unwrap();
+        let (lenient_ast, errors) = parser.build_query_from_user_input_ast_lenient(ast);
+        assert!(errors.is_empty(), "{errors:?}");
+        for query in [from_text, strict_ast, lenient_ast] {
+            fixture.assert_names(query.as_ref(), expected)?;
+            let scores = fixture.scores(query.as_ref())?;
+            assert_eq!(scores.len(), expected.len());
+            for name in expected {
+                assert!((scores[*name] - park_scores[*name]).abs() < 1e-6);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_parser_omits_failed_clauses_during_recovery() -> tantivy::Result<()> {
+    let fixture = Fixture::new(false)?;
+    let parser = QueryParser::for_index(fixture.searcher.index(), Vec::new());
+    let parks = ["p_band", "p_far", "p_hit", "p_ok", "p_small"];
+    for text in [
+        "kind:park AND missing:x",
+        "kind:park OR missing:x",
+        "kind:park AND NOT missing:x",
+    ] {
+        assert_parser_error(
+            &fixture,
+            &parser,
+            text,
+            QueryParserError::FieldDoesNotExist("missing".to_owned()),
+            &parks,
+        )?;
+    }
+    let (query, errors) =
+        parser.parse_query_lenient("kind:park AND geometry:$within(oops, $query(kind:trail))");
+    assert!(!errors.is_empty());
+    fixture.assert_names(query.as_ref(), &parks)?;
+    Ok(())
+}

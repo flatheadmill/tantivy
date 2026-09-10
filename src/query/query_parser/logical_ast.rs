@@ -25,6 +25,7 @@ pub enum LogicalLiteral {
         elements: Vec<Term>,
     },
     All,
+    MatchNone,
     Regex {
         pattern: Arc<Regex>,
         field: Field,
@@ -163,6 +164,7 @@ impl fmt::Debug for LogicalLiteral {
                 write!(formatter, "]")
             }
             LogicalLiteral::All => write!(formatter, "*"),
+            LogicalLiteral::MatchNone => write!(formatter, "MatchNone"),
             LogicalLiteral::Regex {
                 ref pattern,
                 ref field,

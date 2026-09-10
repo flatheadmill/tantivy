@@ -675,6 +675,9 @@ impl QueryParser {
         user_input_ast: UserInputAst,
     ) -> (LogicalAst, Vec<QueryParserError>) {
         match user_input_ast {
+            UserInputAst::Clause(sub_queries) if sub_queries.is_empty() => {
+                (LogicalLiteral::MatchNone.into(), Vec::new())
+            }
             UserInputAst::Clause(sub_queries) => {
                 let default_occur = self.default_occur();
                 let mut logical_sub_queries: Vec<(Occur, LogicalAst)> = Vec::new();
@@ -1041,6 +1044,7 @@ fn convert_literal_to_query(
         LogicalLiteral::Range { lower, upper } => Box::new(RangeQuery::new(lower, upper)),
         LogicalLiteral::Set { elements, .. } => Box::new(TermSetQuery::new(elements)),
         LogicalLiteral::All => Box::new(AllQuery),
+        LogicalLiteral::MatchNone => Box::new(EmptyQuery),
         LogicalLiteral::Regex { pattern, field } => {
             Box::new(RegexQuery::from_regex(pattern, field))
         }
@@ -1456,8 +1460,8 @@ mod test {
 
     #[test]
     pub fn test_parse_query_empty() {
-        test_parse_query_to_logical_ast_helper("", "<emptyclause>", false);
-        test_parse_query_to_logical_ast_helper(" ", "<emptyclause>", false);
+        test_parse_query_to_logical_ast_helper("", "MatchNone", false);
+        test_parse_query_to_logical_ast_helper(" ", "MatchNone", false);
         let query_parser = make_query_parser();
         let query_result = query_parser.parse_query("");
         let query = query_result.unwrap();
@@ -1919,6 +1923,56 @@ mod test {
         let query_parser = make_query_parser();
         assert!(query_parser.parse_query(" !, ").is_ok());
         assert!(query_parser.parse_query("with_stop_words:the").is_ok());
+    }
+
+    #[test]
+    fn test_stopword_clauses_remain_omitted() -> crate::Result<()> {
+        use crate::collector::{DocSetCollector, TopDocs};
+
+        let parser = make_query_parser();
+        let title = parser.schema.get_field("title")?;
+        let mut index = Index::create_in_ram(parser.schema.clone());
+        index.set_tokenizers(parser.tokenizer_manager.clone());
+        let mut writer = index.writer_for_tests()?;
+        writer.add_document(doc!(title => "oak"))?;
+        writer.add_document(doc!(title => "elm"))?;
+        writer.commit()?;
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let reference = parser.parse_query("title:oak")?;
+        let collector = TopDocs::with_limit(10).order_by_score();
+        let expected_docs = searcher.search(reference.as_ref(), &DocSetCollector)?;
+        let expected_scores = searcher.search(reference.as_ref(), &collector)?;
+        assert_eq!(expected_docs.len(), 1);
+        assert_eq!(expected_scores.len(), 1);
+        for text in [
+            "title:oak AND with_stop_words:the",
+            "title:oak OR with_stop_words:the",
+            "title:oak AND NOT with_stop_words:the",
+            "title:oak -with_stop_words:the",
+        ] {
+            let ast = query_grammar::parse_query(text).unwrap();
+            let (lenient_text, errors) = parser.parse_query_lenient(text);
+            assert!(errors.is_empty(), "{errors:?}");
+            let (lenient_ast, errors) = parser.build_query_from_user_input_ast_lenient(ast.clone());
+            assert!(errors.is_empty(), "{errors:?}");
+            for query in [
+                parser.parse_query(text)?,
+                parser.build_query_from_user_input_ast(ast)?,
+                lenient_text,
+                lenient_ast,
+            ] {
+                assert_eq!(
+                    searcher.search(query.as_ref(), &DocSetCollector)?,
+                    expected_docs
+                );
+                assert_eq!(
+                    searcher.search(query.as_ref(), &collector)?,
+                    expected_scores
+                );
+            }
+        }
+        Ok(())
     }
 
     #[test]
