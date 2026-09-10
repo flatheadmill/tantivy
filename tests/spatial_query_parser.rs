@@ -48,6 +48,17 @@ fn and(queries: Vec<Box<dyn Query>>) -> Box<dyn Query> {
     ))
 }
 
+fn parser_queries(parser: &QueryParser, text: &str) -> [Box<dyn Query>; 4] {
+    let ast = query_grammar::parse_query(text).unwrap();
+    let from_text = parser.parse_query(text).unwrap();
+    let from_ast = parser.build_query_from_user_input_ast(ast.clone()).unwrap();
+    let (lenient_text, errors) = parser.parse_query_lenient(text);
+    assert!(errors.is_empty(), "{text}: {errors:?}");
+    let (lenient_ast, errors) = parser.build_query_from_user_input_ast_lenient(ast);
+    assert!(errors.is_empty(), "{text}: {errors:?}");
+    [from_text, from_ast, lenient_text, lenient_ast]
+}
+
 impl Fixture {
     fn new(open_closed_trail: bool) -> tantivy::Result<Self> {
         let mut builder = Schema::builder();
@@ -609,5 +620,138 @@ fn test_parser_applies_fuzzy_settings_to_inner_query() -> tantivy::Result<()> {
         assert!(errors.is_empty(), "{errors:?}");
         fixture.assert_names(built.as_ref(), &expected)?;
     }
+    Ok(())
+}
+
+#[test]
+fn test_parser_nested_negation_preserves_positive_scores() -> tantivy::Result<()> {
+    let fixture = Fixture::new(false)?;
+    let parser = QueryParser::for_index(fixture.searcher.index(), Vec::new());
+    let park_scores = fixture.scores(fixture.parks().as_ref())?;
+    let parks = ["p_band", "p_far", "p_hit", "p_ok", "p_small"];
+    for (text, boost, expected) in [
+        ("kind:park AND NOT open:true", 1.0, parks.as_slice()),
+        ("+kind:park +(-open:true)", 1.0, parks.as_slice()),
+        ("kind:park AND (NOT open:true)^3", 1.0, parks.as_slice()),
+        ("kind:park^3 AND NOT open:true", 3.0, parks.as_slice()),
+        (
+            "kind:park AND (-open:true -kind:road)",
+            1.0,
+            parks.as_slice(),
+        ),
+        (
+            "kind:park AND NOT NOT area:>=50",
+            1.0,
+            ["p_band", "p_far", "p_hit", "p_ok"].as_slice(),
+        ),
+    ] {
+        for query in parser_queries(&parser, text) {
+            fixture.assert_names(query.as_ref(), expected)?;
+            let scores = fixture.scores(query.as_ref())?;
+            assert_eq!(scores.len(), expected.len(), "{text}");
+            for name in expected {
+                assert!(
+                    (scores[*name] - park_scores[*name] * boost).abs() < 1e-6,
+                    "{text}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_parser_negative_groups_with_optional_terms() -> tantivy::Result<()> {
+    let fixture = Fixture::new(false)?;
+    let parser = QueryParser::for_index(fixture.searcher.index(), Vec::new());
+    let park_scores = fixture.scores(fixture.parks().as_ref())?;
+    let open_scores = fixture.scores(&TermQuery::new(
+        Term::from_field_bool(fixture.open, true),
+        IndexRecordOption::Basic,
+    ))?;
+    let closed = [
+        "n_hit", "p_band", "p_far", "p_hit", "p_ok", "p_small", "t_closed",
+    ];
+    for (text, positive_scores, expected) in [
+        (
+            "kind:park OR NOT open:true",
+            &park_scores,
+            closed.as_slice(),
+        ),
+        (
+            "(NOT open:true)^3 OR kind:park",
+            &park_scores,
+            closed.as_slice(),
+        ),
+        (
+            "+(-kind:road) open:true",
+            &open_scores,
+            [
+                "p_band", "p_far", "p_hit", "p_ok", "p_small", "t_closed", "t_open",
+            ]
+            .as_slice(),
+        ),
+        (
+            "kind:park OR (-open:true -kind:road)",
+            &park_scores,
+            ["p_band", "p_far", "p_hit", "p_ok", "p_small", "t_closed"].as_slice(),
+        ),
+    ] {
+        for query in parser_queries(&parser, text) {
+            fixture.assert_names(query.as_ref(), expected)?;
+            let scores = fixture.scores(query.as_ref())?;
+            assert_eq!(scores.len(), expected.len(), "{text}");
+            for name in expected {
+                let expected_score = positive_scores.get(*name).copied().unwrap_or(0.0);
+                assert!(
+                    (scores[*name] - expected_score).abs() < 1e-6,
+                    "{text}: {name}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_parser_negative_roots_keep_existing_contract() -> tantivy::Result<()> {
+    let fixture = Fixture::new(false)?;
+    let parser = QueryParser::for_index(fixture.searcher.index(), Vec::new());
+    let expected = [
+        "p_band", "p_far", "p_hit", "p_ok", "p_small", "t_closed", "t_open",
+    ];
+    for (text, expected_score) in [
+        ("-kind:road", 1.0),
+        ("NOT kind:road", 1.0),
+        ("(-kind:road)^3", 3.0),
+    ] {
+        let ast = query_grammar::parse_query(text).unwrap();
+        assert_eq!(
+            parser.parse_query(text).unwrap_err(),
+            QueryParserError::AllButQueryForbidden
+        );
+        assert_eq!(
+            parser
+                .build_query_from_user_input_ast(ast.clone())
+                .unwrap_err(),
+            QueryParserError::AllButQueryForbidden
+        );
+        for (query, errors) in [
+            parser.parse_query_lenient(text),
+            parser.build_query_from_user_input_ast_lenient(ast),
+        ] {
+            assert_eq!(errors, [QueryParserError::AllButQueryForbidden]);
+            fixture.assert_names(query.as_ref(), &expected)?;
+            let scores = fixture.scores(query.as_ref())?;
+            assert_eq!(scores.len(), expected.len());
+            assert!(
+                scores.values().all(|score| *score == expected_score),
+                "{text}"
+            );
+        }
+    }
+    let excluded = BooleanQuery::new(vec![(Occur::MustNot, term(fixture.kind, "road"))]);
+    fixture.assert_names(&excluded, &[])?;
+    assert!(fixture.scores(&excluded)?.is_empty());
     Ok(())
 }

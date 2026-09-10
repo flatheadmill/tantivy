@@ -18,8 +18,9 @@ use crate::index::Index;
 use crate::json_utils::convert_to_fast_value_and_append_to_json_term;
 use crate::query::range_query::{is_type_valid_for_fastfield_range_query, RangeQuery};
 use crate::query::{
-    AllQuery, BooleanQuery, BoostQuery, EmptyQuery, FuzzyTermQuery, Occur, PhrasePrefixQuery,
-    PhraseQuery, Query, RegexQuery, SpatialPredicate, SpatialQuery, TermQuery, TermSetQuery,
+    AllQuery, BooleanQuery, BoostQuery, ConstScoreQuery, EmptyQuery, FuzzyTermQuery, Occur,
+    PhrasePrefixQuery, PhraseQuery, Query, RegexQuery, SpatialPredicate, SpatialQuery, TermQuery,
+    TermSetQuery,
 };
 use crate::schema::{
     Facet, FacetParseError, Field, FieldType, IndexRecordOption, IntoIpv6Addr, JsonObjectOptions,
@@ -1195,6 +1196,17 @@ fn convert_to_query(fuzzy: &FxHashMap<Field, Fuzzy>, logical_ast: LogicalAst) ->
                 !occur_subqueries.is_empty(),
                 "Should not be empty after trimming"
             );
+
+            if occur_subqueries
+                .iter()
+                .all(|(occur, _)| *occur == Occur::MustNot)
+            {
+                // Nested exclusions need a positive input without adding a score.
+                occur_subqueries.push((
+                    Occur::Must,
+                    Box::new(ConstScoreQuery::new(Box::new(AllQuery), 0.0)),
+                ));
+            }
 
             // If the clause contains a spatial join, absorb the siblings as its outer.
             let join_idx = occur_subqueries
