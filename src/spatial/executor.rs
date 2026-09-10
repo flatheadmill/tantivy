@@ -353,6 +353,11 @@ impl SpatialExecutor {
         Self { root }
     }
 
+    #[cfg(test)]
+    pub(crate) fn root(&self) -> &PlanNode {
+        &self.root
+    }
+
     /// Replace the outer PlanNode in the root Join with the given query.
     pub fn set_outer(&mut self, query: Box<dyn Query>) {
         if let PlanNode::Join { ref mut outer, .. } = self.root {

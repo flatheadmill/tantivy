@@ -926,3 +926,419 @@ fn test_parser_omits_failed_clauses_during_recovery() -> tantivy::Result<()> {
     fixture.assert_names(query.as_ref(), &parks)?;
     Ok(())
 }
+
+mod boolean_regressions {
+    use query_grammar::{SpatialPredicateKind, UserInputAst, UserInputLeaf};
+    use tantivy::query::QueryParser;
+
+    use super::*;
+
+    fn join_ast(relation: &SpatialRelation) -> UserInputAst {
+        let predicate = match relation {
+            SpatialRelation::Near(radius) => SpatialPredicateKind::Within((*radius).into()),
+            SpatialRelation::Intersects => SpatialPredicateKind::Intersects,
+            _ => unreachable!(),
+        };
+        UserInputLeaf::Spatial {
+            field: Some("geometry".to_owned()),
+            predicate,
+            coordinates: Vec::new(),
+            inner_query: Some(Box::new(ast("kind:trail AND open:true"))),
+        }
+        .into()
+    }
+
+    fn join_text(relation: &SpatialRelation) -> &'static str {
+        match relation {
+            SpatialRelation::Near(_) => "geometry:$within(1km, $query(kind:trail AND open:true))",
+            SpatialRelation::Intersects => "geometry:$intersects($query(kind:trail AND open:true))",
+            _ => unreachable!(),
+        }
+    }
+
+    fn ast(text: &str) -> UserInputAst {
+        query_grammar::parse_query(text).unwrap()
+    }
+
+    fn assert_ast_and_text(
+        fixture: &Fixture,
+        input: UserInputAst,
+        text: &str,
+        reference: &dyn Query,
+    ) -> tantivy::Result<()> {
+        assert!(ast(text) == input);
+        let parser = QueryParser::for_index(fixture.searcher.index(), Vec::new());
+        for query in parser_queries(&parser, text) {
+            assert_same_query(fixture, query.as_ref(), reference)?;
+        }
+        Ok(())
+    }
+
+    fn assert_same_query(
+        fixture: &Fixture,
+        query: &dyn Query,
+        reference: &dyn Query,
+    ) -> tantivy::Result<()> {
+        assert_eq!(fixture.names(query)?, fixture.names(reference)?);
+        let actual = fixture.scores(query)?;
+        let expected = fixture.scores(reference)?;
+        assert_eq!(
+            actual.keys().collect::<Vec<_>>(),
+            expected.keys().collect::<Vec<_>>()
+        );
+        for (name, score) in expected {
+            assert!(
+                (actual[&name] - score).abs() < 1e-6,
+                "{name}: parsed {}, expected {score}",
+                actual[&name]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_parser_keeps_nested_outer_predicates() -> tantivy::Result<()> {
+        let fixture = Fixture::new(false)?;
+        let parser = QueryParser::for_index(fixture.searcher.index(), Vec::new());
+        for relation in [SpatialRelation::Near(ONE_KM), SpatialRelation::Intersects] {
+            let input = UserInputAst::and(vec![
+                ast("area:[50 TO *]"),
+                UserInputAst::and(vec![ast("kind:park"), join_ast(&relation)]),
+            ]);
+            let text = format!(
+                "area:[50 TO *] AND (kind:park AND {})",
+                join_text(&relation)
+            );
+            let mut expected = vec!["p_hit"];
+            if matches!(relation, SpatialRelation::Near(_)) {
+                expected.push("p_band");
+            }
+            let reference = and(vec![
+                fixture.large(),
+                fixture.parks(),
+                fixture.join(Box::new(AllQuery), relation),
+            ]);
+            fixture.assert_names(reference.as_ref(), &expected)?;
+            let strict = parser.build_query_from_user_input_ast(input.clone())?;
+            let (lenient, errors) = parser.build_query_from_user_input_ast_lenient(input);
+            assert!(errors.is_empty(), "{errors:?}");
+            for query in [strict, lenient]
+                .into_iter()
+                .chain(parser_queries(&parser, &text))
+            {
+                assert_same_query(&fixture, query.as_ref(), reference.as_ref())?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_parser_preserves_join_union() -> tantivy::Result<()> {
+        let fixture = Fixture::new(false)?;
+        for relation in [SpatialRelation::Near(ONE_KM), SpatialRelation::Intersects] {
+            let input = UserInputAst::or(vec![ast("kind:park"), join_ast(&relation)]);
+            let text = format!("kind:park OR {}", join_text(&relation));
+            let reference = BooleanQuery::new(vec![
+                (Occur::Should, fixture.parks()),
+                (Occur::Should, fixture.join(Box::new(AllQuery), relation)),
+            ]);
+            assert_ast_and_text(&fixture, input, &text, &reference)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_parser_preserves_prohibited_join() -> tantivy::Result<()> {
+        let fixture = Fixture::new(false)?;
+        for relation in [SpatialRelation::Near(ONE_KM), SpatialRelation::Intersects] {
+            let input = UserInputAst::Clause(vec![
+                (Some(Occur::Must), ast("kind:park")),
+                (Some(Occur::MustNot), join_ast(&relation)),
+            ]);
+            let text = format!("kind:park AND -{}", join_text(&relation));
+            let reference = BooleanQuery::new(vec![
+                (Occur::Must, fixture.parks()),
+                (Occur::MustNot, fixture.join(Box::new(AllQuery), relation)),
+            ]);
+            assert_ast_and_text(&fixture, input, &text, &reference)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_parser_preserves_prohibited_sibling() -> tantivy::Result<()> {
+        let fixture = Fixture::new(false)?;
+        for relation in [SpatialRelation::Near(ONE_KM), SpatialRelation::Intersects] {
+            let input = UserInputAst::Clause(vec![
+                (Some(Occur::MustNot), ast("kind:road")),
+                (Some(Occur::Must), join_ast(&relation)),
+            ]);
+            let text = format!("-kind:road +{}", join_text(&relation));
+            let reference = BooleanQuery::new(vec![
+                (Occur::MustNot, term(fixture.kind, "road")),
+                (Occur::Must, fixture.join(Box::new(AllQuery), relation)),
+            ]);
+            assert_ast_and_text(&fixture, input, &text, &reference)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_parser_preserves_negated_join_group() -> tantivy::Result<()> {
+        let fixture = Fixture::new(false)?;
+        for relation in [SpatialRelation::Near(ONE_KM), SpatialRelation::Intersects] {
+            let input = UserInputAst::and(vec![
+                ast("kind:park"),
+                join_ast(&relation).unary(Occur::MustNot),
+            ]);
+            let text = format!("kind:park AND NOT {}", join_text(&relation));
+            let reference = BooleanQuery::new(vec![
+                (Occur::Must, fixture.parks()),
+                (Occur::MustNot, fixture.join(Box::new(AllQuery), relation)),
+            ]);
+            assert_ast_and_text(&fixture, input, &text, &reference)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_parser_keeps_outer_predicate_around_union() -> tantivy::Result<()> {
+        let fixture = Fixture::new(false)?;
+        let parser = QueryParser::for_index(fixture.searcher.index(), Vec::new());
+        for relation in [SpatialRelation::Near(ONE_KM), SpatialRelation::Intersects] {
+            let text = format!("area:[50 TO *] AND (kind:park OR {})", join_text(&relation));
+            let union = BooleanQuery::new(vec![
+                (Occur::Should, fixture.parks()),
+                (Occur::Should, fixture.join(Box::new(AllQuery), relation)),
+            ]);
+            let reference = and(vec![fixture.large(), Box::new(union)]);
+            fixture.assert_names(
+                reference.as_ref(),
+                &["n_hit", "p_band", "p_far", "p_hit", "p_ok"],
+            )?;
+            for query in parser_queries(&parser, &text) {
+                assert_same_query(&fixture, query.as_ref(), reference.as_ref())?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_parser_preserves_outer_score_contribution() -> tantivy::Result<()> {
+        let fixture = Fixture::new(false)?;
+        let parser = QueryParser::for_index(fixture.searcher.index(), Vec::new());
+        for relation in [SpatialRelation::Near(ONE_KM), SpatialRelation::Intersects] {
+            let text = format!("kind:park^3 AND {}", join_text(&relation));
+            let reference = and(vec![
+                Box::new(BoostQuery::new(fixture.parks(), 3.0)),
+                fixture.join(Box::new(AllQuery), relation),
+            ]);
+            for query in parser_queries(&parser, &text) {
+                assert_same_query(&fixture, query.as_ref(), reference.as_ref())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn join_with_inner(
+        fixture: &Fixture,
+        inner: Box<dyn Query>,
+        relation: SpatialRelation,
+    ) -> Box<dyn Query> {
+        Box::new(SpatialExecutor::new(PlanNode::Join {
+            field: fixture.geometry,
+            outer: Box::new(PlanNode::Query(Box::new(AllQuery))),
+            inner: Box::new(PlanNode::Query(inner)),
+            relation,
+        }))
+    }
+
+    #[test]
+    fn test_parser_combines_multiple_joins() -> tantivy::Result<()> {
+        let fixture = Fixture::new(false)?;
+        let parser = QueryParser::for_index(fixture.searcher.index(), Vec::new());
+        for relation in [SpatialRelation::Near(ONE_KM), SpatialRelation::Intersects] {
+            let trail_text = join_text(&relation);
+            let road_text = trail_text.replace("kind:trail AND open:true", "kind:road");
+            let trail = fixture.join(Box::new(AllQuery), relation.clone());
+            let road = join_with_inner(&fixture, term(fixture.kind, "road"), relation.clone());
+            let conjunction = and(vec![fixture.parks(), trail.box_clone(), road.box_clone()]);
+            let union = and(vec![
+                fixture.parks(),
+                Box::new(BooleanQuery::union(vec![trail, road])),
+            ]);
+            let mut union_names = vec!["p_hit", "p_ok", "p_small"];
+            if matches!(relation, SpatialRelation::Near(_)) {
+                union_names.push("p_band");
+            }
+            fixture.assert_names(conjunction.as_ref(), &["p_hit", "p_small"])?;
+            fixture.assert_names(union.as_ref(), &union_names)?;
+            for (text, reference) in [
+                (
+                    format!("kind:park AND {trail_text} AND {road_text}"),
+                    conjunction,
+                ),
+                (
+                    format!("kind:park AND ({trail_text} OR {road_text})"),
+                    union,
+                ),
+            ] {
+                for query in parser_queries(&parser, &text) {
+                    assert_same_query(&fixture, query.as_ref(), reference.as_ref())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_parser_keeps_join_filters_in_or_branches() -> tantivy::Result<()> {
+        let fixture = Fixture::new(false)?;
+        let parser = QueryParser::for_index(fixture.searcher.index(), Vec::new());
+        for relation in [SpatialRelation::Near(ONE_KM), SpatialRelation::Intersects] {
+            let trail_text = join_text(&relation);
+            let road_text = trail_text.replace("kind:trail", "kind:road");
+            let mut expected = vec!["p_hit", "p_small", "t_closed"];
+            if matches!(relation, SpatialRelation::Near(_)) {
+                expected.push("p_band");
+            }
+            let reference = BooleanQuery::union(vec![
+                and(vec![
+                    fixture.parks(),
+                    fixture.join(Box::new(AllQuery), relation.clone()),
+                ]),
+                and(vec![
+                    term(fixture.kind, "trail"),
+                    join_with_inner(&fixture, fixture.open_features("road"), relation),
+                ]),
+            ]);
+            fixture.assert_names(&reference, &expected)?;
+            let text = format!("(kind:park AND {trail_text}) OR (kind:trail AND {road_text})");
+            for query in parser_queries(&parser, &text) {
+                assert_same_query(&fixture, query.as_ref(), &reference)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_parser_preserves_optional_and_boosted_join_scores() -> tantivy::Result<()> {
+        use tantivy::query::ConstScoreQuery;
+
+        let fixture = Fixture::new(false)?;
+        let parser = QueryParser::for_index(fixture.searcher.index(), Vec::new());
+        for relation in [SpatialRelation::Near(ONE_KM), SpatialRelation::Intersects] {
+            let join_text = join_text(&relation);
+            let join = fixture.join(Box::new(AllQuery), relation);
+            let complement = BooleanQuery::new(vec![
+                (Occur::MustNot, join.box_clone()),
+                (
+                    Occur::Must,
+                    Box::new(ConstScoreQuery::new(Box::new(AllQuery), 0.0)),
+                ),
+            ]);
+            let cases: Vec<(String, Box<dyn Query>)> = vec![
+                (
+                    format!("+kind:park {join_text}"),
+                    Box::new(BooleanQuery::new(vec![
+                        (Occur::Must, fixture.parks()),
+                        (Occur::Should, join.box_clone()),
+                    ])),
+                ),
+                (
+                    format!("+{join_text} kind:park"),
+                    Box::new(BooleanQuery::new(vec![
+                        (Occur::Must, join.box_clone()),
+                        (Occur::Should, fixture.parks()),
+                    ])),
+                ),
+                (
+                    format!("kind:park AND ({join_text})^3"),
+                    and(vec![
+                        fixture.parks(),
+                        Box::new(BoostQuery::new(join.box_clone(), 3.0)),
+                    ]),
+                ),
+                (
+                    format!("(kind:park AND {join_text})^3"),
+                    Box::new(BoostQuery::new(
+                        and(vec![fixture.parks(), join.box_clone()]),
+                        3.0,
+                    )),
+                ),
+                (
+                    format!("kind:park OR (NOT {join_text})^3"),
+                    Box::new(BooleanQuery::union(vec![
+                        fixture.parks(),
+                        Box::new(BoostQuery::new(Box::new(complement), 3.0)),
+                    ])),
+                ),
+                (
+                    format!("kind:park AND NOT NOT {join_text}"),
+                    and(vec![
+                        fixture.parks(),
+                        Box::new(ConstScoreQuery::new(join, 0.0)),
+                    ]),
+                ),
+            ];
+            for (text, reference) in cases {
+                assert!(!fixture.names(reference.as_ref())?.is_empty(), "{text}");
+                for query in parser_queries(&parser, &text) {
+                    assert_same_query(&fixture, query.as_ref(), reference.as_ref())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_parser_keeps_ordinary_boolean_scores() -> tantivy::Result<()> {
+        let fixture = Fixture::new(false)?;
+        let parser = QueryParser::for_index(fixture.searcher.index(), Vec::new());
+        for (text, occurs, boost, count) in [
+            (
+                "kind:park open:false",
+                [Occur::Should, Occur::Should],
+                1.0,
+                7,
+            ),
+            (
+                "+kind:park open:false",
+                [Occur::Must, Occur::Should],
+                1.0,
+                5,
+            ),
+            (
+                "kind:park AND open:false",
+                [Occur::Must, Occur::Must],
+                1.0,
+                5,
+            ),
+            (
+                "kind:park OR open:false",
+                [Occur::Should, Occur::Should],
+                1.0,
+                7,
+            ),
+            (
+                "(kind:park open:false)^2",
+                [Occur::Should, Occur::Should],
+                2.0,
+                7,
+            ),
+        ] {
+            let closed = Box::new(TermQuery::new(
+                Term::from_field_bool(fixture.open, false),
+                IndexRecordOption::Basic,
+            ));
+            let reference =
+                BooleanQuery::new(vec![(occurs[0], fixture.parks()), (occurs[1], closed)]);
+            let reference = BoostQuery::new(Box::new(reference), boost);
+            assert_eq!(fixture.names(&reference)?.len(), count);
+            for query in parser_queries(&parser, text) {
+                assert_same_query(&fixture, query.as_ref(), &reference)?;
+            }
+        }
+        Ok(())
+    }
+}

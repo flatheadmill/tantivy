@@ -22,6 +22,11 @@ Tantivy's query builder accepts distance and intersection joins, and literal
 distance, intersection, and containment predicates. Recognized but unimplemented
 predicates return `UnsupportedQuery` during resolution.
 
+A spatial join remains a Boolean clause, including when it is optional or
+prohibited. Required ordinary predicates restrict its outer input before
+spatial evaluation and retain their scores in the containing Boolean query.
+Each inner query argument is resolved and evaluated as an independent input.
+
 An empty user AST matches no documents, including when it is a child of a
 Boolean group. This also applies to an empty `Clause` supplied directly to a
 query builder. Terms omitted during tokenization or query resolution are still

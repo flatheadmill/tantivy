@@ -1009,6 +1009,7 @@ impl QueryParser {
 fn convert_literal_to_query(
     fuzzy: &FxHashMap<Field, Fuzzy>,
     logical_literal: LogicalLiteral,
+    outer_filters: &[Box<dyn Query>],
 ) -> Box<dyn Query> {
     match logical_literal {
         LogicalLiteral::Term(term) => {
@@ -1065,9 +1066,19 @@ fn convert_literal_to_query(
                     }
                 };
                 let inner_query = convert_to_query(fuzzy, *inner_ast);
+                let outer_query: Box<dyn Query> = if outer_filters.is_empty() {
+                    Box::new(AllQuery)
+                } else {
+                    Box::new(BooleanQuery::intersection(
+                        outer_filters
+                            .iter()
+                            .map(|query| query.box_clone())
+                            .collect(),
+                    ))
+                };
                 Box::new(SpatialExecutor::new(PlanNode::Join {
                     field,
-                    outer: Box::new(PlanNode::Query(Box::new(AllQuery))),
+                    outer: Box::new(PlanNode::Query(outer_query)),
                     inner: Box::new(PlanNode::Query(inner_query)),
                     relation,
                 }))
@@ -1190,12 +1201,67 @@ fn generate_literals_for_json_object(
 }
 
 fn convert_to_query(fuzzy: &FxHashMap<Field, Fuzzy>, logical_ast: LogicalAst) -> Box<dyn Query> {
+    convert_to_query_with_filters(fuzzy, logical_ast, &[])
+}
+
+fn contains_spatial_join(ast: &LogicalAst) -> bool {
+    match ast {
+        LogicalAst::Clause(children) => children
+            .iter()
+            .any(|(_, child)| contains_spatial_join(child)),
+        LogicalAst::Boost(child, _) => contains_spatial_join(child),
+        LogicalAst::Leaf(literal) => matches!(
+            literal.as_ref(),
+            LogicalLiteral::Spatial {
+                inner_query: Some(_),
+                ..
+            }
+        ),
+    }
+}
+
+fn convert_to_query_with_filters(
+    fuzzy: &FxHashMap<Field, Fuzzy>,
+    logical_ast: LogicalAst,
+    outer_filters: &[Box<dyn Query>],
+) -> Box<dyn Query> {
     match trim_ast(logical_ast) {
         Some(LogicalAst::Clause(trimmed_clause)) => {
-            let mut occur_subqueries = trimmed_clause
+            let mut occur_subqueries = Vec::with_capacity(trimmed_clause.len());
+            let mut deferred = Vec::new();
+            for (occur, subquery) in trimmed_clause {
+                let query = if contains_spatial_join(&subquery) {
+                    deferred.push((occur_subqueries.len(), subquery));
+                    None
+                } else {
+                    Some(convert_to_query(fuzzy, subquery))
+                };
+                occur_subqueries.push((occur, query));
+            }
+
+            if !deferred.is_empty() {
+                let mut filters: Vec<Box<dyn Query>> = outer_filters
+                    .iter()
+                    .map(|query| query.box_clone())
+                    .collect();
+                // Keep required predicates here for scoring and copy them into join inputs.
+                filters.extend(
+                    occur_subqueries
+                        .iter()
+                        .filter(|(occur, _)| *occur == Occur::Must)
+                        .filter_map(|(_, query)| query.as_ref())
+                        .map(|query| query.box_clone()),
+                );
+                for (index, subquery) in deferred {
+                    occur_subqueries[index].1 =
+                        Some(convert_to_query_with_filters(fuzzy, subquery, &filters));
+                }
+            }
+
+            let mut occur_subqueries: Vec<(Occur, Box<dyn Query>)> = occur_subqueries
                 .into_iter()
-                .map(|(occur, subquery)| (occur, convert_to_query(fuzzy, subquery)))
-                .collect::<Vec<_>>();
+                .map(|(occur, query)| (occur, query.expect("all clauses have been converted")))
+                .collect();
             assert!(
                 !occur_subqueries.is_empty(),
                 "Should not be empty after trimming"
@@ -1212,31 +1278,13 @@ fn convert_to_query(fuzzy: &FxHashMap<Field, Fuzzy>, logical_ast: LogicalAst) ->
                 ));
             }
 
-            // If the clause contains a spatial join, absorb the siblings as its outer.
-            let join_idx = occur_subqueries
-                .iter()
-                .position(|(_, q)| q.is::<SpatialExecutor>());
-            if let Some(idx) = join_idx {
-                let (_, join_query) = occur_subqueries.remove(idx);
-                let mut executor = *join_query.downcast::<SpatialExecutor>().unwrap();
-                let outer: Box<dyn Query> = if occur_subqueries.is_empty() {
-                    Box::new(AllQuery)
-                } else if occur_subqueries.len() == 1 {
-                    occur_subqueries.pop().unwrap().1
-                } else {
-                    Box::new(BooleanQuery::new(occur_subqueries))
-                };
-                executor.set_outer(outer);
-                Box::new(executor)
-            } else {
-                Box::new(BooleanQuery::new(occur_subqueries))
-            }
+            Box::new(BooleanQuery::new(occur_subqueries))
         }
         Some(LogicalAst::Leaf(trimmed_logical_literal)) => {
-            convert_literal_to_query(fuzzy, *trimmed_logical_literal)
+            convert_literal_to_query(fuzzy, *trimmed_logical_literal, outer_filters)
         }
         Some(LogicalAst::Boost(ast, boost)) => {
-            let query = convert_to_query(fuzzy, *ast);
+            let query = convert_to_query_with_filters(fuzzy, *ast, outer_filters);
             let boosted_query = BoostQuery::new(query, boost);
             Box::new(boosted_query)
         }
@@ -2487,6 +2535,216 @@ mod test {
             let (query, errors) = parser.build_query_from_user_input_ast_lenient(ast);
             assert!(errors.is_empty(), "{errors:?}");
             assert!(query.is::<crate::query::SpatialQuery>());
+        }
+    }
+
+    fn boolean_child(query: &dyn Query, index: usize) -> &dyn Query {
+        query
+            .downcast_ref::<crate::query::BooleanQuery>()
+            .unwrap()
+            .clauses()[index]
+            .1
+            .as_ref()
+    }
+
+    fn join_inputs(query: &dyn Query) -> (&dyn Query, &dyn Query) {
+        use crate::spatial::executor::{PlanNode, SpatialExecutor};
+
+        let executor = query.downcast_ref::<SpatialExecutor>().unwrap();
+        let PlanNode::Join { outer, inner, .. } = executor.root() else {
+            panic!("expected a join");
+        };
+        let (PlanNode::Query(outer), PlanNode::Query(inner)) = (outer.as_ref(), inner.as_ref())
+        else {
+            panic!("expected query inputs");
+        };
+        (outer.as_ref(), inner.as_ref())
+    }
+
+    fn assert_join_filters(parser: &QueryParser, query: &dyn Query, filters: &[&str]) {
+        use crate::query::{AllQuery, BooleanQuery};
+
+        let expected: Box<dyn Query> = if filters.is_empty() {
+            Box::new(AllQuery)
+        } else {
+            Box::new(BooleanQuery::intersection(
+                filters
+                    .iter()
+                    .map(|text| parser.parse_query(text).unwrap())
+                    .collect(),
+            ))
+        };
+        let (outer, _) = join_inputs(query);
+        assert_eq!(format!("{outer:?}"), format!("{expected:?}"));
+    }
+
+    #[test]
+    fn test_spatial_filters_follow_required_clauses() {
+        let parser = make_query_parser();
+        let join = "geometry:$within(1km, $query(title:c))";
+        for (text, path, filters) in [
+            (
+                format!("title:a AND (title:b AND {join})"),
+                vec![1, 1],
+                vec!["title:a", "title:b"],
+            ),
+            (
+                format!("title:a AND (title:b OR {join})"),
+                vec![1, 1],
+                vec!["title:a"],
+            ),
+            (format!("title:b OR {join}"), vec![1], vec![]),
+            (format!("+title:a {join}"), vec![1], vec!["title:a"]),
+            (format!("+title:a -{join}"), vec![1], vec!["title:a"]),
+            (format!("-title:b +{join}"), vec![1], vec![]),
+            (
+                format!("+title:a -title:b +{join}"),
+                vec![2],
+                vec!["title:a"],
+            ),
+            (
+                format!("(title:a OR title:b) AND {join}"),
+                vec![1],
+                vec!["title:a OR title:b"],
+            ),
+            (
+                format!("(title:a OR title:b)^2 AND {join}"),
+                vec![1],
+                vec!["(title:a OR title:b)^2"],
+            ),
+            (
+                format!("geometry:$intersects(0 0, 1 0, 0 1) AND {join}"),
+                vec![1],
+                vec!["geometry:$intersects(0 0, 1 0, 0 1)"],
+            ),
+        ] {
+            let ast = query_grammar::parse_query(&text).unwrap();
+            let query = parser.build_query_from_user_input_ast(ast).unwrap();
+            let mut child = query.as_ref();
+            for index in path {
+                child = boolean_child(child, index);
+            }
+            assert_join_filters(&parser, child, &filters);
+        }
+    }
+
+    #[test]
+    fn test_spatial_filters_keep_required_negation_groups() {
+        use crate::query::{AllQuery, BooleanQuery, ConstScoreQuery, Occur};
+
+        let parser = make_query_parser();
+        let query = parser
+            .parse_query("NOT title:a AND geometry:$within(1km, $query(title:b))")
+            .unwrap();
+        let excluded = BooleanQuery::new(vec![
+            (Occur::MustNot, parser.parse_query("title:a").unwrap()),
+            (
+                Occur::Must,
+                Box::new(ConstScoreQuery::new(Box::new(AllQuery), 0.0)),
+            ),
+        ]);
+        let expected = BooleanQuery::intersection(vec![Box::new(excluded)]);
+        let (outer, _) = join_inputs(boolean_child(query.as_ref(), 1));
+        assert_eq!(format!("{outer:?}"), format!("{expected:?}"));
+    }
+
+    #[test]
+    fn test_spatial_filters_stay_in_or_branches() {
+        let parser = make_query_parser();
+        let query = parser
+            .parse_query(
+                "(title:a AND geometry:$within(1km, $query(title:c))) OR (title:b AND \
+                 geometry:$within(1km, $query(title:d)))",
+            )
+            .unwrap();
+        for (index, filter) in ["title:a", "title:b"].into_iter().enumerate() {
+            let branch = boolean_child(query.as_ref(), index);
+            assert_join_filters(&parser, boolean_child(branch, 1), &[filter]);
+        }
+    }
+
+    #[test]
+    fn test_spatial_filters_exclude_join_subtrees() {
+        let parser = make_query_parser();
+        let first = "geometry:$within(1km, $query(title:b))";
+        let second = "geometry:$within(1km, $query(title:c))";
+        for text in [
+            format!("title:a AND {first} AND {second}"),
+            format!("title:a AND ({first})^2 AND {second}"),
+            format!("title:a AND (title:d OR {first}) AND {second}"),
+        ] {
+            let query = parser.parse_query(&text).unwrap();
+            assert_join_filters(&parser, boolean_child(query.as_ref(), 2), &["title:a"]);
+        }
+    }
+
+    #[test]
+    fn test_spatial_inner_filters_start_at_each_input() {
+        let parser = make_query_parser();
+        let query = parser
+            .parse_query(
+                "title:a AND geometry:$within(1km, $query(title:b AND geometry:$within(1km, \
+                 $query(title:c))))",
+            )
+            .unwrap();
+        let outer_join = boolean_child(query.as_ref(), 1);
+        assert_join_filters(&parser, outer_join, &["title:a"]);
+        let (_, inner) = join_inputs(outer_join);
+        let inner_join = boolean_child(inner, 1);
+        assert_join_filters(&parser, inner_join, &["title:b"]);
+        let (_, inner) = join_inputs(inner_join);
+        assert_eq!(
+            format!("{inner:?}"),
+            format!("{:?}", parser.parse_query("title:c").unwrap())
+        );
+    }
+
+    #[test]
+    fn test_ordinary_conversion_preserves_occurrences() {
+        use crate::query::{BooleanQuery, BoostQuery, Occur, TermQuery};
+
+        let parser = make_query_parser();
+        let title = parser.schema.get_field("title").unwrap();
+        for (text, occurs, minimum, boost) in [
+            ("title:a title:b", [Occur::Should, Occur::Should], 1, 1.0),
+            ("+title:a title:b", [Occur::Must, Occur::Should], 0, 1.0),
+            ("title:a AND title:b", [Occur::Must, Occur::Must], 0, 1.0),
+            ("title:a OR title:b", [Occur::Should, Occur::Should], 1, 1.0),
+            (
+                "(title:a title:b)^2",
+                [Occur::Should, Occur::Should],
+                1,
+                2.0,
+            ),
+        ] {
+            let expected = BooleanQuery::with_minimum_required_clauses(
+                occurs
+                    .into_iter()
+                    .zip(["a", "b"])
+                    .map(|(occur, word)| {
+                        (
+                            occur,
+                            Box::new(TermQuery::new(
+                                Term::from_field_text(title, word),
+                                IndexRecordOption::WithFreqs,
+                            )) as Box<dyn Query>,
+                        )
+                    })
+                    .collect(),
+                minimum,
+            );
+            let expected: Box<dyn Query> = if boost == 1.0 {
+                Box::new(expected)
+            } else {
+                Box::new(BoostQuery::new(Box::new(expected), boost))
+            };
+            let ast = query_grammar::parse_query(text).unwrap();
+            for query in [
+                parser.parse_query(text).unwrap(),
+                parser.build_query_from_user_input_ast(ast).unwrap(),
+            ] {
+                assert_eq!(format!("{query:?}"), format!("{expected:?}"), "{text}");
+            }
         }
     }
 }
