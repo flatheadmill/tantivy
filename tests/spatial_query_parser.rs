@@ -3,8 +3,8 @@ use std::ops::Bound;
 
 use tantivy::collector::{DocSetCollector, TopDocs};
 use tantivy::query::{
-    AllQuery, BooleanQuery, BoostQuery, EmptyQuery, Occur, Query, QueryParser, RangeQuery,
-    SpatialPredicate, SpatialQuery, TermQuery,
+    AllQuery, BooleanQuery, BoostQuery, EmptyQuery, Occur, Query, QueryParser, QueryParserError,
+    RangeQuery, SpatialPredicate, SpatialQuery, TermQuery,
 };
 use tantivy::schema::{Field, IndexRecordOption, Schema, Value, INDEXED, SPHERE, STORED, STRING};
 use tantivy::spatial::executor::{PlanNode, SpatialExecutor, SpatialRelation};
@@ -352,6 +352,262 @@ fn test_parser_builds_spatial_inner_queries() -> tantivy::Result<()> {
             assert!(errors.is_empty(), "{errors:?}");
             fixture.assert_names(from_ast.as_ref(), &expected)?;
         }
+    }
+    Ok(())
+}
+
+fn assert_parser_error(
+    fixture: &Fixture,
+    parser: &QueryParser,
+    text: &str,
+    error: QueryParserError,
+    expected_names: &[&str],
+) -> tantivy::Result<()> {
+    let ast = query_grammar::parse_query(text).unwrap();
+    assert_eq!(parser.parse_query(text).unwrap_err(), error);
+    assert_eq!(
+        parser
+            .build_query_from_user_input_ast(ast.clone())
+            .unwrap_err(),
+        error
+    );
+    let (query, errors) = parser.parse_query_lenient(text);
+    assert_eq!(errors.as_slice(), std::slice::from_ref(&error));
+    fixture.assert_names(query.as_ref(), expected_names)?;
+    let (query, errors) = parser.build_query_from_user_input_ast_lenient(ast);
+    assert_eq!(errors.as_slice(), std::slice::from_ref(&error));
+    fixture.assert_names(query.as_ref(), expected_names)
+}
+
+#[test]
+fn test_parser_reports_inner_unknown_field() -> tantivy::Result<()> {
+    let fixture = Fixture::new(false)?;
+    let parser = QueryParser::for_index(fixture.searcher.index(), Vec::new());
+    for predicate in ["$within(1km, ", "$intersects("] {
+        for inner in [
+            "unknown:trail".to_string(),
+            format!("kind:trail AND geometry:{predicate}$query(unknown:road))"),
+        ] {
+            assert_parser_error(
+                &fixture,
+                &parser,
+                &format!("kind:park AND geometry:{predicate}$query({inner}))"),
+                QueryParserError::FieldDoesNotExist("unknown".to_string()),
+                &[],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_parser_keeps_recovered_inner_query() -> tantivy::Result<()> {
+    let fixture = Fixture::new(false)?;
+    let parser = QueryParser::for_index(fixture.searcher.index(), Vec::new());
+    for (predicate, expected) in [
+        ("$within(1km, ", vec!["p_band", "p_hit", "p_ok", "p_small"]),
+        ("$intersects(", vec!["p_hit", "p_ok", "p_small"]),
+    ] {
+        assert_parser_error(
+            &fixture,
+            &parser,
+            &format!("kind:park AND geometry:{predicate}$query(kind:trail AND unknown:x))"),
+            QueryParserError::FieldDoesNotExist("unknown".to_string()),
+            &expected,
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn test_parser_validates_negative_inner_root() -> tantivy::Result<()> {
+    let fixture = Fixture::new(false)?;
+    let parser = QueryParser::for_index(fixture.searcher.index(), Vec::new());
+    for (predicate, relation) in [
+        ("$within(1km, ", SpatialRelation::Near(ONE_KM)),
+        ("$intersects(", SpatialRelation::Intersects),
+    ] {
+        let reference = SpatialExecutor::new(PlanNode::Join {
+            field: fixture.geometry,
+            outer: Box::new(PlanNode::Query(fixture.parks())),
+            inner: Box::new(PlanNode::Query(Box::new(BooleanQuery::new(vec![
+                (Occur::Should, Box::new(AllQuery)),
+                (Occur::MustNot, term(fixture.kind, "road")),
+            ])))),
+            relation: relation.clone(),
+        });
+        let expected = fixture.names(&reference)?;
+        assert!(expected.iter().any(|name| name == "p_ok"));
+        if matches!(relation, SpatialRelation::Near(_)) {
+            // Every park, including p_far, is in the inner input and is near itself.
+            fixture.assert_names(&reference, &["p_band", "p_far", "p_hit", "p_ok", "p_small"])?;
+        }
+        assert_parser_error(
+            &fixture,
+            &parser,
+            &format!("kind:park AND geometry:{predicate}$query(-kind:road))"),
+            QueryParserError::AllButQueryForbidden,
+            &expected.iter().map(String::as_str).collect::<Vec<_>>(),
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn test_parser_separates_inner_syntax_and_resolution_errors() -> tantivy::Result<()> {
+    let fixture = Fixture::new(false)?;
+    let parser = QueryParser::for_index(fixture.searcher.index(), Vec::new());
+    let text = "kind:park AND geometry:$within(1km, $query(unknown:x AND kind:))";
+    let (ast, grammar_errors) = query_grammar::parse_query_lenient(text);
+    assert_eq!(
+        grammar_errors,
+        vec![query_grammar::LenientError {
+            pos: 62,
+            message: "expected word".to_string(),
+        }]
+    );
+    assert_eq!(
+        parser.parse_query(text).unwrap_err(),
+        QueryParserError::SyntaxError(text.to_string())
+    );
+    assert_eq!(
+        parser
+            .build_query_from_user_input_ast(ast.clone())
+            .unwrap_err(),
+        QueryParserError::FieldDoesNotExist("unknown".to_string())
+    );
+    let (query, errors) = parser.parse_query_lenient(text);
+    assert_eq!(
+        errors,
+        vec![
+            QueryParserError::SyntaxError("expected word at position 62".to_string()),
+            QueryParserError::FieldDoesNotExist("unknown".to_string()),
+        ]
+    );
+    fixture.assert_names(query.as_ref(), &[])?;
+    let (query, errors) = parser.build_query_from_user_input_ast_lenient(ast);
+    assert_eq!(
+        errors,
+        vec![QueryParserError::FieldDoesNotExist("unknown".to_string())]
+    );
+    fixture.assert_names(query.as_ref(), &[])
+}
+
+#[test]
+fn test_parser_rejects_unsupported_spatial_forms() -> tantivy::Result<()> {
+    let fixture = Fixture::new(false)?;
+    let parser = QueryParser::for_index(fixture.searcher.index(), Vec::new());
+    let parks = ["p_band", "p_far", "p_hit", "p_ok", "p_small"];
+    for (spatial, message) in [
+        (
+            "$contains($query(unknown:trail))",
+            "$contains joins are not supported.",
+        ),
+        (
+            "$between(1km, 2km, $query(unknown:trail))",
+            "$between is not supported.",
+        ),
+        ("$between(1km, 2km, 1 2)", "$between is not supported."),
+        ("$knn(3, 1 2)", "$knn is not supported."),
+    ] {
+        assert_parser_error(
+            &fixture,
+            &parser,
+            &format!("kind:park AND geometry:{spatial}"),
+            QueryParserError::UnsupportedQuery(message.to_string()),
+            &parks,
+        )?;
+    }
+    assert_parser_error(
+        &fixture,
+        &parser,
+        "kind:park AND missing:$contains($query(unknown:x))",
+        QueryParserError::FieldDoesNotExist("missing".to_string()),
+        &parks,
+    )?;
+    Ok(())
+}
+
+#[test]
+fn test_parser_validates_programmatic_spatial_forms() -> tantivy::Result<()> {
+    use query_grammar::{SpatialPredicateKind, UserInputAst, UserInputLeaf};
+
+    let fixture = Fixture::new(false)?;
+    let parser = QueryParser::for_index(fixture.searcher.index(), Vec::new());
+    for (predicate, coordinates, message) in [
+        (
+            SpatialPredicateKind::Knn(3),
+            Vec::new(),
+            "$knn is not supported.",
+        ),
+        (
+            SpatialPredicateKind::Within(ONE_KM.into()),
+            vec![(1.0.into(), 2.0.into())],
+            "Spatial joins cannot also specify coordinates.",
+        ),
+    ] {
+        let ast = UserInputAst::and(vec![
+            query_grammar::parse_query("kind:park").unwrap(),
+            UserInputLeaf::Spatial {
+                field: Some("geometry".to_string()),
+                predicate,
+                coordinates,
+                inner_query: Some(Box::new(query_grammar::parse_query("kind:trail").unwrap())),
+            }
+            .into(),
+        ]);
+        assert_eq!(
+            parser
+                .build_query_from_user_input_ast(ast.clone())
+                .unwrap_err(),
+            QueryParserError::UnsupportedQuery(message.to_string())
+        );
+        let (query, errors) = parser.build_query_from_user_input_ast_lenient(ast);
+        assert_eq!(
+            errors,
+            vec![QueryParserError::UnsupportedQuery(message.to_string())]
+        );
+        fixture.assert_names(
+            query.as_ref(),
+            &["p_band", "p_far", "p_hit", "p_ok", "p_small"],
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn test_parser_applies_fuzzy_settings_to_inner_query() -> tantivy::Result<()> {
+    let fixture = Fixture::new(false)?;
+    for (predicate, relation, expected) in [
+        (
+            "$within(1km, ",
+            SpatialRelation::Near(ONE_KM),
+            vec!["p_band", "p_hit", "p_small"],
+        ),
+        (
+            "$intersects(",
+            SpatialRelation::Intersects,
+            vec!["p_hit", "p_small"],
+        ),
+    ] {
+        let mut parser = QueryParser::for_index(fixture.searcher.index(), Vec::new());
+        let text = format!("kind:park AND geometry:{predicate}$query(kind:trai AND open:true))");
+        let ast = query_grammar::parse_query(&text).unwrap();
+        let exact = parser.parse_query(&text).unwrap();
+        fixture.assert_names(exact.as_ref(), &[])?;
+        parser.set_field_fuzzy(fixture.kind, false, 1, true);
+        let reference = fixture.join(fixture.parks(), relation);
+        fixture.assert_names(reference.as_ref(), &expected)?;
+        let parsed = parser.parse_query(&text).unwrap();
+        fixture.assert_names(parsed.as_ref(), &expected)?;
+        let built = parser.build_query_from_user_input_ast(ast.clone()).unwrap();
+        fixture.assert_names(built.as_ref(), &expected)?;
+        let (parsed, errors) = parser.parse_query_lenient(&text);
+        assert!(errors.is_empty(), "{errors:?}");
+        fixture.assert_names(parsed.as_ref(), &expected)?;
+        let (built, errors) = parser.build_query_from_user_input_ast_lenient(ast);
+        assert!(errors.is_empty(), "{errors:?}");
+        fixture.assert_names(built.as_ref(), &expected)?;
     }
     Ok(())
 }

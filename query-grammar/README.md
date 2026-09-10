@@ -16,3 +16,8 @@ the inner query when its boundary can be identified. If invalid parameters or
 an unfinished expression prevent finding that boundary, it discards the
 malformed call and the remaining input. When only the call's closing parenthesis
 is missing after a complete query argument, later clauses can still be parsed.
+
+The grammar recognizes spatial syntax independently of execution support.
+Tantivy's query builder accepts distance and intersection joins, and literal
+distance, intersection, and containment predicates. Recognized but unimplemented
+predicates return `UnsupportedQuery` during resolution.

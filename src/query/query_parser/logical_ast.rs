@@ -2,7 +2,7 @@ use std::fmt;
 use std::ops::Bound;
 use std::sync::Arc;
 
-use query_grammar::{SpatialPredicateKind, UserInputAst};
+use query_grammar::SpatialPredicateKind;
 use tantivy_fst::Regex;
 
 use crate::query::Occur;
@@ -33,10 +33,11 @@ pub enum LogicalLiteral {
         field: Field,
         predicate: SpatialPredicateKind,
         coordinates: Vec<[f64; 2]>,
-        inner_query: Option<Box<UserInputAst>>,
+        inner_query: Option<Box<LogicalAst>>,
     },
 }
 
+#[derive(Clone)]
 pub enum LogicalAst {
     Clause(Vec<(Occur, LogicalAst)>),
     Leaf(Box<LogicalLiteral>),

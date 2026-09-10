@@ -73,7 +73,7 @@ pub enum PlanNode {
         field: Field,
         /// The query geometry (smashed).
         geometry: GeometrySet<Sphere>,
-        /// Maximum distance (chord angle length2).
+        /// Maximum distance in radians.
         radius: f64,
         /// Documents passing this node are eligible candidates.
         filter: Box<PlanNode>,
