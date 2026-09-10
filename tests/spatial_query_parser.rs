@@ -1,12 +1,15 @@
 use std::collections::BTreeMap;
 use std::ops::Bound;
 
-use tantivy::collector::{DocSetCollector, TopDocs};
+use tantivy::collector::{Count, DocSetCollector, FacetCollector, TopDocs};
+use tantivy::merge_policy::NoMergePolicy;
 use tantivy::query::{
     AllQuery, BooleanQuery, BoostQuery, EmptyQuery, Occur, Query, QueryParser, QueryParserError,
     RangeQuery, SpatialPredicate, SpatialQuery, TermQuery,
 };
-use tantivy::schema::{Field, IndexRecordOption, Schema, Value, INDEXED, SPHERE, STORED, STRING};
+use tantivy::schema::{
+    Facet, FacetOptions, Field, IndexRecordOption, Schema, Value, INDEXED, SPHERE, STORED, STRING,
+};
 use tantivy::spatial::executor::{PlanNode, SpatialExecutor, SpatialRelation};
 use tantivy::{DocAddress, Index, IndexWriter, Score, Searcher, TantivyDocument, Term};
 
@@ -61,15 +64,21 @@ fn parser_queries(parser: &QueryParser, text: &str) -> [Box<dyn Query>; 4] {
 
 impl Fixture {
     fn new(open_closed_trail: bool) -> tantivy::Result<Self> {
+        Self::with_deletions(open_closed_trail, &[])
+    }
+
+    fn with_deletions(open_closed_trail: bool, deleted_names: &[&str]) -> tantivy::Result<Self> {
         let mut builder = Schema::builder();
         let geometry = builder.add_spatial_field("geometry", SPHERE);
-        let name = builder.add_text_field("name", STORED);
+        let name = builder.add_text_field("name", STRING | STORED);
         let kind = builder.add_text_field("kind", STRING);
         let open = builder.add_bool_field("open", INDEXED);
         let area = builder.add_u64_field("area", INDEXED);
+        builder.add_facet_field("category", FacetOptions::default());
         let schema = builder.build();
         let index = Index::create_in_ram(schema.clone());
         let mut writer: IndexWriter = index.writer_with_num_threads(1, 50_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
         for (label, kind, area, is_open, lon, lat) in [
             ("p_ok", "park", 100u64, false, 0.00, 0.00),
             ("p_hit", "park", 100, false, 1.00, 0.00),
@@ -82,11 +91,13 @@ impl Fixture {
             // This park is disjoint from t_open, but within one kilometer.
             ("p_band", "park", 100, false, 1.061, 0.00),
         ] {
+            let size = if area >= 50 { "large" } else { "small" };
             let json = serde_json::json!({
                 "name": label,
                 "kind": kind,
                 "open": is_open,
                 "area": area,
+                "category": format!("/{kind}/{size}"),
                 "geometry": {
                     "type": "Polygon",
                     "coordinates": [square(lon, lat)],
@@ -96,8 +107,23 @@ impl Fixture {
         }
         writer.commit()?;
         let reader = index.reader()?;
+        if !deleted_names.is_empty() {
+            for label in deleted_names {
+                writer.delete_term(Term::from_field_text(name, label));
+            }
+            writer.commit()?;
+            reader.reload()?;
+        }
+        let searcher = reader.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1);
+        let segment = &searcher.segment_readers()[0];
+        // Deleted geometry must remain in the segment for these tests.
+        assert_eq!(
+            (segment.max_doc(), segment.num_deleted_docs()),
+            (9, deleted_names.len() as u32)
+        );
         Ok(Self {
-            searcher: reader.searcher(),
+            searcher,
             geometry,
             name,
             kind,
@@ -182,6 +208,222 @@ impl Fixture {
         assert_eq!(self.names(query)?, expected);
         Ok(())
     }
+
+    fn assert_collectors(
+        &self,
+        context: &str,
+        query: &dyn Query,
+        expected_names: &[&str],
+        expected_facets: &[(&str, u64)],
+    ) -> tantivy::Result<()> {
+        let mut names = expected_names.to_vec();
+        names.sort();
+        assert_eq!(self.names(query)?, names, "{context}: matching names");
+        assert_eq!(
+            self.searcher.search(query, &Count)?,
+            expected_names.len(),
+            "{context}: count"
+        );
+        let mut collector = FacetCollector::for_field("category");
+        collector.add_facet("/park");
+        let counts = self.searcher.search(query, &collector)?;
+        let actual: Vec<_> = counts
+            .get("/park")
+            .map(|(facet, count)| (facet.clone(), count))
+            .collect();
+        let expected: Vec<_> = expected_facets
+            .iter()
+            .map(|(path, count)| (Facet::from(*path), *count))
+            .collect();
+        // FacetCollector omits buckets with no matching documents.
+        assert_eq!(actual, expected, "{context}: facets");
+        Ok(())
+    }
+
+    fn assert_parser_collectors(
+        &self,
+        text: &str,
+        reference: &dyn Query,
+        expected_names: &[&str],
+        expected_facets: &[(&str, u64)],
+    ) -> tantivy::Result<()> {
+        self.assert_collectors(
+            &format!("reference: {text}"),
+            reference,
+            expected_names,
+            expected_facets,
+        )?;
+        let parser = QueryParser::for_index(self.searcher.index(), Vec::new());
+        for (route, query) in ["text", "ast", "lenient text", "lenient ast"]
+            .into_iter()
+            .zip(parser_queries(&parser, text))
+        {
+            self.assert_collectors(
+                &format!("{route}: {text}"),
+                query.as_ref(),
+                expected_names,
+                expected_facets,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn test_parser_collectors_use_join_matches() -> tantivy::Result<()> {
+    let fixture = Fixture::new(false)?;
+    for (relation, predicate) in [
+        (SpatialRelation::Near(ONE_KM), "$within(1km, $query"),
+        (SpatialRelation::Intersects, "$intersects($query"),
+    ] {
+        let near = matches!(relation, SpatialRelation::Near(_));
+        for (occur, prefix, names, facets) in [
+            (
+                Occur::Must,
+                "",
+                if near {
+                    ["p_band", "p_hit", "p_small"].as_slice()
+                } else {
+                    ["p_hit", "p_small"].as_slice()
+                },
+                [
+                    ("/park/large", if near { 2 } else { 1 }),
+                    ("/park/small", 1),
+                ]
+                .as_slice(),
+            ),
+            (
+                Occur::MustNot,
+                "NOT ",
+                if near {
+                    ["p_far", "p_ok"].as_slice()
+                } else {
+                    ["p_band", "p_far", "p_ok"].as_slice()
+                },
+                [("/park/large", if near { 2 } else { 3 })].as_slice(),
+            ),
+        ] {
+            let reference = BooleanQuery::new(vec![
+                (Occur::Must, fixture.parks()),
+                (occur, fixture.join(Box::new(AllQuery), relation.clone())),
+            ]);
+            let text =
+                format!("kind:park AND {prefix}geometry:{predicate}(kind:trail AND open:true))");
+            fixture.assert_parser_collectors(&text, &reference, names, facets)?;
+        }
+        for (occur, prefix, names, facets) in [
+            (Occur::Must, "", [].as_slice(), [].as_slice()),
+            (
+                Occur::MustNot,
+                "NOT ",
+                ["p_band", "p_far", "p_hit", "p_ok", "p_small"].as_slice(),
+                [("/park/large", 4), ("/park/small", 1)].as_slice(),
+            ),
+        ] {
+            let empty_join = SpatialExecutor::new(PlanNode::Join {
+                field: fixture.geometry,
+                outer: Box::new(PlanNode::Query(Box::new(AllQuery))),
+                inner: Box::new(PlanNode::Query(Box::new(EmptyQuery))),
+                relation: relation.clone(),
+            });
+            let reference = BooleanQuery::new(vec![
+                (Occur::Must, fixture.parks()),
+                (occur, Box::new(empty_join)),
+            ]);
+            let text = format!("kind:park AND {prefix}geometry:{predicate}(kind:missing))");
+            fixture.assert_parser_collectors(&text, &reference, names, facets)?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_parser_joins_ignore_deleted_inner_geometry() -> tantivy::Result<()> {
+    let fixture = Fixture::with_deletions(true, &["t_open"])?;
+    for (relation, predicate) in [
+        (
+            SpatialRelation::Near(ONE_KM),
+            "$within(1km, $query(kind:trail AND open:true))",
+        ),
+        (
+            SpatialRelation::Intersects,
+            "$intersects($query(kind:trail AND open:true))",
+        ),
+    ] {
+        for (occur, prefix, names, facets) in [
+            (
+                Occur::Must,
+                "",
+                ["p_ok"].as_slice(),
+                [("/park/large", 1)].as_slice(),
+            ),
+            (
+                Occur::MustNot,
+                "NOT ",
+                ["p_band", "p_far", "p_hit", "p_small"].as_slice(),
+                [("/park/large", 3), ("/park/small", 1)].as_slice(),
+            ),
+        ] {
+            let reference = BooleanQuery::new(vec![
+                (Occur::Must, fixture.parks()),
+                (occur, fixture.join(Box::new(AllQuery), relation.clone())),
+            ]);
+            let text = format!("kind:park AND {prefix}geometry:{predicate}");
+            fixture.assert_parser_collectors(&text, &reference, names, facets)?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_parser_joins_ignore_deleted_outer_geometry() -> tantivy::Result<()> {
+    let fixture = Fixture::with_deletions(false, &["p_hit"])?;
+    for (relation, predicate) in [
+        (
+            SpatialRelation::Near(ONE_KM),
+            "$within(1km, $query(kind:trail AND open:true))",
+        ),
+        (
+            SpatialRelation::Intersects,
+            "$intersects($query(kind:trail AND open:true))",
+        ),
+    ] {
+        let near = matches!(relation, SpatialRelation::Near(_));
+        for (occur, prefix, names, facets) in [
+            (
+                Occur::Must,
+                "",
+                if near {
+                    ["p_band", "p_small"].as_slice()
+                } else {
+                    ["p_small"].as_slice()
+                },
+                if near {
+                    [("/park/large", 1), ("/park/small", 1)].as_slice()
+                } else {
+                    [("/park/small", 1)].as_slice()
+                },
+            ),
+            (
+                Occur::MustNot,
+                "NOT ",
+                if near {
+                    ["p_far", "p_ok"].as_slice()
+                } else {
+                    ["p_band", "p_far", "p_ok"].as_slice()
+                },
+                [("/park/large", if near { 2 } else { 3 })].as_slice(),
+            ),
+        ] {
+            let reference = BooleanQuery::new(vec![
+                (Occur::Must, fixture.parks()),
+                (occur, fixture.join(Box::new(AllQuery), relation.clone())),
+            ]);
+            let text = format!("kind:park AND {prefix}geometry:{predicate}");
+            fixture.assert_parser_collectors(&text, &reference, names, facets)?;
+        }
+    }
+    Ok(())
 }
 
 #[test]
