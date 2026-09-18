@@ -5,6 +5,7 @@ use crate::spatial::crossings::S2EdgeCrosser;
 use crate::spatial::edge_reader::EdgeReader;
 use crate::spatial::geometry::Geometry;
 use crate::spatial::geometry_set::{to_geometry_set, EdgeSet};
+use crate::spatial::intersects::Intersects;
 use crate::spatial::plane::Plane;
 use crate::spatial::sphere::Sphere;
 use crate::{Index, IndexWriter, TantivyDocument};
@@ -181,6 +182,85 @@ fn square(x: f64, y: f64, radius: f64) -> Geometry<Plane> {
         [x - radius, y + radius],
         [x - radius, y - radius],
     ]])
+}
+
+fn check_query_inside_candidate(query: &Geometry<Plane>, contained_member: usize) {
+    // The candidate straddles the equator, keeping its edges in the face cell.
+    // The cell center at (0, 0) lies outside both indexed polygons.
+    let fixture = Fixture::new(&[square(10.0, 0.001, 0.01), square(30.0, -20.0, 0.01)]);
+    let set = to_geometry_set(&query.project::<Sphere>(), 0);
+    let vertex = &set.members[contained_member].vertices[0];
+    let reader = CellIndexReader::open_with_doc_ids(&fixture.cells, &fixture.doc_ids);
+    let mut cache = EdgeCache::new(vec![EdgeReader::<Sphere>::open(&fixture.edges)], 100_000);
+    let cell = reader.find(Sphere::cell_id_from_point(vertex)).unwrap();
+    let shape = cell.find_shape((0, 0)).unwrap();
+    let candidate = cache.locate(shape.geometry_id);
+    assert_eq!(candidate.doc_id, 0);
+    assert!(candidate.closed);
+    assert!(!shape.contains_center);
+    assert!(!shape.edge_indices.is_empty());
+
+    let center = Sphere::cell_center(cell.cell_id);
+    let mut crosser = S2EdgeCrosser::new(&center, vertex);
+    let crossings = shape
+        .edge_indices
+        .iter()
+        .filter(|&&edge| {
+            let (a, b) = candidate.edge(edge);
+            crosser.edge_or_vertex_crossing_two(&a, &b)
+        })
+        .count();
+    assert_eq!(crossings, 1, "the query vertex must be inside by parity");
+
+    // Neither edge crossings nor an indexed vertex inside the query can supply the hit.
+    for gid in 0..2 {
+        let indexed = cache.get((0, gid));
+        let indexed = indexed.edge_set();
+        assert!(!inside(&center, indexed));
+        for (member_id, member) in set.members.iter().enumerate() {
+            for vertex in &member.vertices {
+                assert_eq!(
+                    inside(vertex, indexed),
+                    gid == 0 && member_id == contained_member,
+                    "query member {member_id}, indexed geometry {gid}"
+                );
+            }
+            assert!(indexed
+                .vertices
+                .iter()
+                .all(|vertex| !inside(vertex, member)));
+            for (a, b) in member_edges(indexed) {
+                let mut crosser = S2EdgeCrosser::new(&a, &b);
+                for (c, d) in member_edges(member) {
+                    assert_eq!(crosser.crossing_sign_two(&c, &d), -1);
+                }
+            }
+        }
+    }
+
+    let intersects = Intersects::new(set, CovererOptions::default());
+    let hits = intersects.search(&reader, None, &mut cache, fixture.max_doc);
+    assert_eq!(hits.len(), 1);
+    assert!(hits.contains(0));
+    fixture.check(query, 0.0, &[0]);
+    fixture.check(query, 1.0, &[0]);
+}
+
+#[test]
+fn test_query_inside_candidate_with_boundary_edges() {
+    check_query_inside_candidate(&square(10.003, 0.004, 0.002), 0);
+}
+
+#[test]
+fn test_later_query_member_inside_candidate_with_boundary_edges() {
+    let Geometry::Polygon(outside) = square(-20.0, 25.0, 0.002) else {
+        unreachable!()
+    };
+    let Geometry::Polygon(inside) = square(10.003, 0.004, 0.002) else {
+        unreachable!()
+    };
+    // Member 0 is disjoint; only member 1 exercises the pre-scan.
+    check_query_inside_candidate(&Geometry::MultiPolygon(vec![outside, inside]), 1);
 }
 
 #[test]
