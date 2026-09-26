@@ -36,6 +36,7 @@ use crate::DocId;
 
 /// Default skip interval for the edge index skip list directory.
 const EDGE_SKIP_INTERVAL: u32 = 16;
+const MERGE_EDGE_CACHE_MAX_VERTICES: usize = 4_000_000;
 
 /// Source segment data for a spatial merge.
 pub struct MergeSource<'a> {
@@ -180,7 +181,7 @@ impl<S: Surface + Send + Sync + Clone + 'static> SpatialIndex for SurfaceIndex<S
             segment_names.push(source.segment_name.clone());
         }
 
-        let edge_cache = EdgeCache::new(edge_readers, 2_000_000_000);
+        let edge_cache = EdgeCache::new(edge_readers, MERGE_EDGE_CACHE_MAX_VERTICES);
         let iters = cell_readers.iter().map(|cr| cr.iter()).collect();
         let mut interleave = Interleaver::new(iters, &edge_cache, alive_bitsets, segment_names);
 
