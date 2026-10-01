@@ -45,6 +45,17 @@ impl<S: Surface> Intersects<S> {
         }
     }
 
+    fn contains_point(&self, point: &S::Point) -> bool {
+        (0..self.query_edges.set.members.len()).any(|member| {
+            index_contains_point::<S, QueryEdgeProvider<S>>(
+                &self.query_index,
+                &self.query_edges,
+                (0, member as u32),
+                point,
+            )
+        })
+    }
+
     /// Search one segment for geometries that intersect the query polygon.
     pub fn search<'a>(
         &self,
@@ -102,20 +113,7 @@ impl<S: Surface> Intersects<S> {
         for query_cell in &self.query_index.cells {
             let cell_id = query_cell.cell_id;
 
-            let mut query_edge_indices: Vec<u32> = Vec::new();
-            let mut contains_center = false;
-            for shape in &query_cell.shapes {
-                query_edge_indices.extend_from_slice(&shape.edge_indices);
-                if shape.contains_center {
-                    contains_center = true;
-                }
-            }
-
             let (index_start, index_end) = reader.range_for_cell(cell_id, 0, reader.cell_count());
-
-            if index_start == index_end && query_edge_indices.is_empty() && !contains_center {
-                continue;
-            }
 
             let first_index_level = if index_start < index_end {
                 reader.cell_id_at(index_start).level()
@@ -123,17 +121,29 @@ impl<S: Surface> Intersects<S> {
                 0
             };
 
-            heap.push(CoveringCell {
-                pcell: S2PaddedCell::new(cell_id, S::CELL_PADDING),
-                query_edges: query_edge_indices,
-                contains_center,
-                index_start,
-                index_end,
-                first_index_level,
-            });
+            // Each member needs its own crossing parity.
+            for shape in &query_cell.shapes {
+                if index_start == index_end
+                    && shape.edge_indices.is_empty()
+                    && !shape.contains_center
+                {
+                    continue;
+                }
+                heap.push((
+                    CoveringCell {
+                        pcell: S2PaddedCell::new(cell_id, S::CELL_PADDING),
+                        query_edges: shape.edge_indices.clone(),
+                        contains_center: shape.contains_center,
+                        index_start,
+                        index_end,
+                        first_index_level,
+                    },
+                    shape.geometry_id.1,
+                ));
+            }
         }
 
-        while let Some(entry) = heap.pop() {
+        while let Some((entry, member)) = heap.pop() {
             if entry.query_edges.is_empty()
                 && entry.contains_center
                 && entry.first_index_level > entry.pcell.level()
@@ -163,7 +173,7 @@ impl<S: Surface> Intersects<S> {
                     }
                 }
             } else if entry.pcell.level() < entry.first_index_level && !entry.pcell.id().is_leaf() {
-                let get_edge = |idx: u32| self.query_edges.get_edge((0, 0), idx);
+                let get_edge = |idx: u32| self.query_edges.get_edge((0, member), idx);
                 let start_for_cell = |cell_id: S2CellId, lo: u32, hi: u32| {
                     let start = reader.start_for_cell(cell_id, lo, hi);
                     let level = if start < hi {
@@ -177,10 +187,9 @@ impl<S: Surface> Intersects<S> {
                 let mut children = covering_split(&entry, &get_edge, &start_for_cell);
                 covering_contains_center::<S>(&parent_center, &mut children, &get_edge);
                 for child in children {
-                    heap.push(child);
+                    heap.push((child, member));
                 }
             } else {
-                let query_vertices = &self.query_edges.get_edge_set((0, 0)).vertices;
                 for pos in entry.index_start..entry.index_end {
                     let cell = reader.cell_at(pos);
                     for clipped in &cell.shapes {
@@ -203,12 +212,7 @@ impl<S: Surface> Intersects<S> {
 
                             let located = edge_cache.locate(clipped.geometry_id);
                             let first_vertex = located.vertex(0);
-                            if index_contains_point::<S, QueryEdgeProvider<S>>(
-                                &self.query_index,
-                                &self.query_edges,
-                                (0, 0),
-                                &first_vertex,
-                            ) {
+                            if self.contains_point(&first_vertex) {
                                 seen.insert(gid);
                                 doc_ids.insert(located.doc_id);
                                 continue;
@@ -223,10 +227,10 @@ impl<S: Surface> Intersects<S> {
                                         let (cv0, cv1) = located.edge(candidate_edge_idx);
                                         let mut crosser = S::EdgeCrosser::new(&cv0, &cv1);
                                         for &query_edge_idx in &entry.query_edges {
-                                            let qi = query_edge_idx as usize;
-                                            let qv0 = &query_vertices[qi];
-                                            let qv1 = &query_vertices[qi + 1];
-                                            if crosser.crossing_sign_two(qv0, qv1) > 0 {
+                                            let (qv0, qv1) = self
+                                                .query_edges
+                                                .get_edge((0, member), query_edge_idx);
+                                            if crosser.crossing_sign_two(&qv0, &qv1) > 0 {
                                                 break 'crossing true;
                                             }
                                         }
@@ -247,3 +251,7 @@ impl<S: Surface> Intersects<S> {
         doc_ids
     }
 }
+
+#[cfg(test)]
+#[path = "tests/intersects_tests.rs"]
+mod tests;
