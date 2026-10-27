@@ -93,7 +93,7 @@ impl Fixture {
             );
         }
         let mut query = Distance::new(set, meters / EARTH_RADIUS, CovererOptions::default());
-        let reader = CellIndexReader::open_with_doc_ids(&self.cells, &self.doc_ids);
+        let reader = CellIndexReader::open_with_doc_ids(&self.cells, &self.doc_ids).unwrap();
         let mut cache = EdgeCache::new(vec![EdgeReader::<Sphere>::open(&self.edges)], 100_000);
         let mut filter = BitSet::with_max_value(self.max_doc);
         for doc in 0..self.max_doc {
@@ -190,7 +190,7 @@ fn check_query_inside_candidate(query: &Geometry<Plane>, contained_member: usize
     let fixture = Fixture::new(&[square(10.0, 0.001, 0.01), square(30.0, -20.0, 0.01)]);
     let set = to_geometry_set(&query.project::<Sphere>(), 0);
     let vertex = &set.members[contained_member].vertices[0];
-    let reader = CellIndexReader::open_with_doc_ids(&fixture.cells, &fixture.doc_ids);
+    let reader = CellIndexReader::open_with_doc_ids(&fixture.cells, &fixture.doc_ids).unwrap();
     let mut cache = EdgeCache::new(vec![EdgeReader::<Sphere>::open(&fixture.edges)], 100_000);
     let cell = reader.find(Sphere::cell_id_from_point(vertex)).unwrap();
     let shape = cell.find_shape((0, 0)).unwrap();
@@ -337,7 +337,7 @@ fn test_ancestor_cell_does_not_imply_a_match() {
         [lon, lat],
         [lon, lat + (20_000.0 / EARTH_RADIUS).to_degrees()],
     ])]);
-    let reader = CellIndexReader::open(&fixture.cells);
+    let reader = CellIndexReader::open(&fixture.cells).unwrap();
     assert_eq!(reader.cell_count(), 1);
     assert_eq!(reader.cell_id_at(0).level(), 8);
     fixture.check(
@@ -404,7 +404,7 @@ fn test_merged_mixed_levels_preserve_interior_and_sparse_boundary_hits() {
         !fixture.doc_ids.is_empty(),
         "expected a doc-id sidecar after merging"
     );
-    let cells = CellIndexReader::open(&fixture.cells);
+    let cells = CellIndexReader::open(&fixture.cells).unwrap();
     let levels: HashSet<_> = cells.iter().map(|cell| cell.cell_id.level()).collect();
     assert!(levels.len() > 1, "expected cells at different levels");
     fixture.check_reference(&square(0.0, 0.0, 0.01), 61.0);
@@ -455,7 +455,7 @@ fn test_computed_distance_threshold_is_inclusive() {
         let set = to_geometry_set(&Geometry::<Plane>::Point([0.0, 0.0]).project::<Sphere>(), 0);
         let distance = full_distance(&set, &to_geometry_set(&candidate.project::<Sphere>(), 0));
         let mut query = Distance::new(set, meters / EARTH_RADIUS, CovererOptions::default());
-        let reader = CellIndexReader::open(&fixture.cells);
+        let reader = CellIndexReader::open(&fixture.cells).unwrap();
         let mut cache = EdgeCache::new(vec![EdgeReader::<Sphere>::open(&fixture.edges)], 100_000);
         // Set the chord threshold directly so conversion to radians and back cannot change it.
         // The boundary search still includes its rounding allowance around this distance.

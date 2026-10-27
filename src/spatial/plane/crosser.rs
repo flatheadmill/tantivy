@@ -1,8 +1,8 @@
 //! Stateful edge crosser for planar geometry.
 //!
-//! Same interface as S2EdgeCrosser but uses orient2d for crossing decisions.
+//! Same interface as S2EdgeCrosser but uses exact orientation signs for crossing decisions.
 
-use super::math::orient2d;
+use super::math::orient2d_sign;
 use crate::spatial::edge_crosser::EdgeCrosser;
 
 /// Stateful edge crosser for the plane. Holds a reference edge AB and tests successive edges
@@ -24,13 +24,12 @@ impl PlaneEdgeCrosser {
             return 0;
         }
 
-        let d1 = orient2d(&self.a, &self.b, c);
-        let d2 = orient2d(&self.a, &self.b, d);
-        let d3 = orient2d(c, d, &self.a);
-        let d4 = orient2d(c, d, &self.b);
+        let d1 = orient2d_sign(&self.a, &self.b, c);
+        let d2 = orient2d_sign(&self.a, &self.b, d);
+        let d3 = orient2d_sign(c, d, &self.a);
+        let d4 = orient2d_sign(c, d, &self.b);
 
-        if ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0))
-            && ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0))
+        if ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0))
         {
             return 1;
         }
@@ -61,20 +60,20 @@ impl EdgeCrosser for PlaneEdgeCrosser {
         // Translating AB adds (B.y - A.y)*e - (B.x - A.x)*e^2 to each orientation.
         let ab_positive =
             self.b[1] > self.a[1] || (self.b[1] == self.a[1] && self.a[0] > self.b[0]);
-        let hc = orient2d(&self.a, &self.b, c);
-        let hd = orient2d(&self.a, &self.b, d);
-        let c_positive = hc > 0.0 || (hc == 0.0 && ab_positive);
-        let d_positive = hd > 0.0 || (hd == 0.0 && ab_positive);
+        let hc = orient2d_sign(&self.a, &self.b, c);
+        let hd = orient2d_sign(&self.a, &self.b, d);
+        let c_positive = hc > 0 || (hc == 0 && ab_positive);
+        let d_positive = hd > 0 || (hd == 0 && ab_positive);
         if c_positive == d_positive {
             return false;
         }
 
         // Translating a point relative to CD adds -(D.y - C.y)*e + (D.x - C.x)*e^2.
         let cd_positive = c[1] > d[1] || (c[1] == d[1] && d[0] > c[0]);
-        let ha = orient2d(c, d, &self.a);
-        let hb = orient2d(c, d, &self.b);
-        let a_positive = ha > 0.0 || (ha == 0.0 && cd_positive);
-        let b_positive = hb > 0.0 || (hb == 0.0 && cd_positive);
+        let ha = orient2d_sign(c, d, &self.a);
+        let hb = orient2d_sign(c, d, &self.b);
+        let a_positive = ha > 0 || (ha == 0 && cd_positive);
+        let b_positive = hb > 0 || (hb == 0 && cd_positive);
         a_positive != b_positive
     }
 }

@@ -146,7 +146,7 @@ impl Fixture {
     }
 
     fn reader(&self) -> CellIndexReader<'_> {
-        CellIndexReader::open(&self.cells)
+        CellIndexReader::open(&self.cells).unwrap()
     }
 
     fn cache<S: Surface>(&self) -> EdgeCache<'_, S> {

@@ -5,8 +5,10 @@
 //! faces of a cube projection.
 
 use super::edge_crosser::EdgeCrosser;
+use super::r1interval::R1Interval;
+use super::r2rect::R2Rect;
 use super::s2cell_id::S2CellId;
-use super::s2coords::si_ti_to_st;
+use super::s2coords::{ij_to_st_min, si_ti_to_st};
 
 /// An abstraction one of two surfaces for geographic indices. For planar geometry, points are 2D
 /// coordinates on a single face. For spherical geometry, points are 3D unit vectors on the six
@@ -44,6 +46,21 @@ pub trait Surface {
     /// Cell padding for edge clipping. Compensates for face clipping error on the
     /// sphere. Zero on the plane where clip_to_face is exact.
     const CELL_PADDING: f64;
+
+    /// Edges are straight in face UV, and surface coordinates equal UV coordinates
+    /// without projection or clipping error. Endpoint boxes enclose the complete edge.
+    const EXACT_SUPPORT: bool = false;
+
+    /// Whether an original edge meets a closed nominal rectangle on this face.
+    /// Called only when EXACT_SUPPORT is true.
+    fn edge_intersects_rect(
+        _v0: &Self::Point,
+        _v1: &Self::Point,
+        _face: i32,
+        _bound: &R2Rect,
+    ) -> bool {
+        unreachable!("surface does not provide exact cell support")
+    }
 
     /// Number of cube faces. 6 for Sphere, 1 for Plane.
     const FACE_COUNT: i32;
@@ -84,6 +101,39 @@ pub trait Surface {
 
     /// Whether the point is inside the closed ring.
     fn contains_point(point: &Self::Point, ring: &[Self::Point], origin_inside: bool) -> bool;
+}
+
+/// The nominal face UV rectangle of a cell, without padding.
+pub(crate) fn cell_bound_uv<S: Surface>(cell_id: S2CellId) -> R2Rect {
+    let (_, i, j, _) = cell_id.to_face_ij_orientation();
+    let cell_size = S2CellId::size_ij_for_level(cell_id.level());
+    let i_lo = i & -cell_size;
+    let j_lo = j & -cell_size;
+    R2Rect::new(
+        R1Interval::new(
+            S::st_to_uv(ij_to_st_min(i_lo)),
+            S::st_to_uv(ij_to_st_min(i_lo + cell_size)),
+        ),
+        R1Interval::new(
+            S::st_to_uv(ij_to_st_min(j_lo)),
+            S::st_to_uv(ij_to_st_min(j_lo + cell_size)),
+        ),
+    )
+}
+
+/// Certify contact before retaining an endpoint box as a conservative bound.
+pub(crate) fn exact_edge_bound<S: Surface>(
+    v0: &S::Point,
+    v1: &S::Point,
+    face: i32,
+    bound: &R2Rect,
+) -> Option<R2Rect> {
+    if !S::edge_intersects_rect(v0, v1, face, bound) {
+        return None;
+    }
+    let (a_u, a_v) = S::point_to_face_uv(face, v0);
+    let (b_u, b_v) = S::point_to_face_uv(face, v1);
+    Some(R2Rect::from_point_pair([a_u, a_v], [b_u, b_v]).intersection(bound))
 }
 
 /// Returns the center of a cell using the same ij midpoint computation as S2PaddedCell.

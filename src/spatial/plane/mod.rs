@@ -3,6 +3,7 @@
 pub mod crosser;
 pub mod math;
 
+use crate::spatial::r2rect::R2Rect;
 use crate::spatial::s2cell_id::S2CellId;
 use crate::spatial::s2coords::{ij_to_st_min, st_to_ij};
 use crate::spatial::surface::Surface;
@@ -57,6 +58,13 @@ impl Surface for Plane {
     }
 
     const CELL_PADDING: f64 = 0.0;
+
+    const EXACT_SUPPORT: bool = true;
+
+    #[inline]
+    fn edge_intersects_rect(v0: &Self::Point, v1: &Self::Point, face: i32, bound: &R2Rect) -> bool {
+        face == 0 && math::segment_intersects_rect(v0, v1, bound)
+    }
 
     const FACE_COUNT: i32 = 1;
 

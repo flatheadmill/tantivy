@@ -53,7 +53,7 @@ impl<S: Surface> Fixture<S> {
     }
 
     fn reader(&self) -> CellIndexReader<'_> {
-        CellIndexReader::open_with_doc_ids(&self.cells, &self.doc_ids)
+        CellIndexReader::open_with_doc_ids(&self.cells, &self.doc_ids).unwrap()
     }
 
     fn check(&self, query: &Intersects<S>, expected: &[u32]) {
@@ -66,7 +66,7 @@ impl<S: Surface> Fixture<S> {
             let reader = if sidecar {
                 self.reader()
             } else {
-                CellIndexReader::open(&self.cells)
+                CellIndexReader::open(&self.cells).unwrap()
             };
             for terms_filter in [None, Some(&filter)] {
                 let mut cache = EdgeCache::new(vec![EdgeReader::<S>::open(&self.edges)], 100_000);

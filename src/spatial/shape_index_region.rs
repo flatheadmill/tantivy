@@ -15,17 +15,14 @@ use super::edge_cache::EdgeCache;
 use super::edge_crosser::EdgeCrosser;
 use super::edge_provider::EdgeProvider;
 use super::latlng_rect::S2LatLngRect;
-use super::r1interval::R1Interval;
-use super::r2rect::R2Rect;
 use super::region::Region;
 use super::s2cap::S2Cap;
 use super::s2cell::S2Cell;
 use super::s2cell_id::S2CellId;
-use super::s2coords::ij_to_st_min;
 use super::s2edge_clipping::{
     intersects_rect, FACE_CLIP_ERROR_UV_COORD, INTERSECTS_RECT_ERROR_UV_DIST,
 };
-use super::surface::Surface;
+use super::surface::{cell_bound_uv, Surface};
 use crate::spatial::shape_index::ShapeIndex;
 
 /// Minimal clipped shape data for indexed containment. Owned to avoid lifetime mismatches between
@@ -141,27 +138,6 @@ impl<S: Surface> ContainmentIndex<S> for SegmentIndex<'_, '_, S> {
     }
 }
 
-/// Compute a cell's UV bounding rectangle using the surface-specific st_to_uv transform.
-fn cell_bound_uv<S: Surface>(cell_id: S2CellId) -> R2Rect {
-    let (_, i, j, _) = cell_id.to_face_ij_orientation();
-    let level = cell_id.level();
-    let cell_size = S2CellId::size_ij_for_level(level);
-    let i_lo = i & -cell_size;
-    let j_lo = j & -cell_size;
-    let i_hi = i_lo + cell_size;
-    let j_hi = j_lo + cell_size;
-    R2Rect::new(
-        R1Interval::new(
-            S::st_to_uv(ij_to_st_min(i_lo)),
-            S::st_to_uv(ij_to_st_min(i_hi)),
-        ),
-        R1Interval::new(
-            S::st_to_uv(ij_to_st_min(j_lo)),
-            S::st_to_uv(ij_to_st_min(j_hi)),
-        ),
-    )
-}
-
 /// Maximum error in edge-cell intersection tests.
 ///
 /// This combines the error from face clipping and rectangle intersection to ensure we don't miss
@@ -171,15 +147,22 @@ pub const ANY_EDGE_INTERSECTS_MAX_ERROR: f64 =
 
 /// Returns true if any edge of the clipped shape intersects the target cell.
 ///
-/// The test uses UV-space bounds expanded by the maximum clipping error to avoid missing edges
-/// that nearly touch the cell boundary.
+/// Plane tests the nominal closed rectangle. Sphere expands the bounds by its clipping error.
 pub fn any_edge_intersects<S: Surface, E: EdgeProvider<Point = S::Point>>(
     clipped: &ClippedShape,
     target: &S2Cell,
     edges: &E,
 ) -> bool {
-    let bound = cell_bound_uv::<S>(target.id()).expanded(ANY_EDGE_INTERSECTS_MAX_ERROR);
+    let bound = cell_bound_uv::<S>(target.id());
     let face = target.face();
+
+    if S::EXACT_SUPPORT {
+        return clipped.edge_indices.iter().any(|&edge_index| {
+            let (v0, v1) = edges.get_edge(clipped.geometry_id, edge_index);
+            S::edge_intersects_rect(&v0, &v1, face, &bound)
+        });
+    }
+    let bound = bound.expanded(ANY_EDGE_INTERSECTS_MAX_ERROR);
 
     for &edge_index in &clipped.edge_indices {
         let (v0, v1) = edges.get_edge(clipped.geometry_id, edge_index);

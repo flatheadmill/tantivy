@@ -140,7 +140,7 @@ fn test_cell_id_from_point_serialized_lookup() {
     let index = unequal_depth_index();
     let mut bytes = Vec::new();
     index.write(&mut CountingWriter::wrap(&mut bytes));
-    let reader = CellIndexReader::open(&bytes);
+    let reader = CellIndexReader::open(&bytes).unwrap();
     for point in lookup_points(&index) {
         let expected = containing_cell(&index, point);
         assert_eq!(

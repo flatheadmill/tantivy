@@ -167,9 +167,9 @@ pub fn point_in_polygon(p: &[f64; 2], vertices: &[[f64; 2]]) -> bool {
         let vi = &vertices[i];
         let vj = &vertices[j];
         if (vi[1] > p[1]) != (vj[1] > p[1]) {
-            let orientation = orient2d(vi, vj, p);
+            let orientation = orient2d_sign(vi, vj, p);
             // A boundary edge is left of the displaced point and crosses its leftward ray.
-            if orientation == 0.0 || (orientation > 0.0) == (vi[1] > vj[1]) {
+            if orientation == 0 || (orientation > 0) == (vi[1] > vj[1]) {
                 inside = !inside;
             }
         }

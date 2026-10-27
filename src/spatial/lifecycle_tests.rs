@@ -117,7 +117,7 @@ fn assert_sidecar(index: &Index, geometry: Field, populated: bool) -> crate::Res
                 [-30.0, 30.0],
                 [-30.0, -30.0],
             ]]);
-            let cells = CellIndexReader::open(field.cells_bytes());
+            let cells = CellIndexReader::open(field.cells_bytes())?;
             for [lon, lat] in [[-30.0, -30.0], [30.0, -30.0], [30.0, 30.0], [-30.0, 30.0]] {
                 let cell = Sphere::cell_id_from_point(&Sphere::project(lon, lat));
                 assert!(cells.find(cell).is_none());
@@ -129,7 +129,7 @@ fn assert_sidecar(index: &Index, geometry: Field, populated: bool) -> crate::Res
                 &[],
                 field.doc_ids_bytes(),
                 reader.max_doc(),
-            );
+            )?;
             assert_eq!(included.len(), reader.num_docs() as usize);
         }
     }

@@ -1,11 +1,26 @@
 //! The spatial index produced by the clipper and consumed by queries.
 
-use std::io::Write;
+use std::io::{self, Write};
 
 use common::CountingWriter;
 
 use super::clipped_shape::{ClippedShape, GeometryId};
 use crate::spatial::s2cell_id::S2CellId;
+
+pub(crate) const CELL_MAGIC: &[u8; 4] = b"TCEL";
+pub(crate) const CELL_REVISION: u32 = 1;
+pub(crate) const CELL_FOOTER_LEN: usize = 20;
+
+pub(crate) fn write_cell_footer(
+    write: &mut impl Write,
+    cell_count: u32,
+    dir_offset: u64,
+) -> io::Result<()> {
+    write.write_all(&cell_count.to_le_bytes())?;
+    write.write_all(&dir_offset.to_le_bytes())?;
+    write.write_all(CELL_MAGIC)?;
+    write.write_all(&CELL_REVISION.to_le_bytes())
+}
 
 /// Stores the index contents for a particular S2CellId.
 ///
@@ -161,10 +176,6 @@ impl ShapeIndex {
             write.write_all(&doc_id_offset.to_le_bytes()).unwrap();
         }
 
-        // Footer: cell count, directory offset.
-        write
-            .write_all(&(self.cells.len() as u32).to_le_bytes())
-            .unwrap();
-        write.write_all(&dir_offset.to_le_bytes()).unwrap();
+        write_cell_footer(write, self.cells.len() as u32, dir_offset).unwrap();
     }
 }

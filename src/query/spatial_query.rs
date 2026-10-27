@@ -153,9 +153,6 @@ impl Weight for SpatialWeight {
         reader: &crate::SegmentReader,
         boost: crate::Score,
     ) -> crate::Result<Box<dyn super::Scorer>> {
-        if reader.max_doc() == 0 {
-            return Ok(Box::new(EmptyScorer));
-        }
         let spatial_reader = match reader.spatial_fields().get_field(self.field)? {
             Some(reader) => reader,
             None => {
@@ -169,7 +166,11 @@ impl Weight for SpatialWeight {
             spatial_reader.edges_bytes(),
             spatial_reader.doc_ids_bytes(),
             reader.max_doc(),
-        );
+        )?;
+
+        if reader.max_doc() == 0 {
+            return Ok(Box::new(EmptyScorer));
+        }
 
         Ok(Box::new(SpatialScorer::new(boost, include)))
     }

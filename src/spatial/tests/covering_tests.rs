@@ -156,7 +156,7 @@ fn test_coarse_index_range_reaches_every_child() {
     };
     let mut bytes = Vec::new();
     index.write(&mut CountingWriter::wrap(&mut bytes));
-    let reader = CellIndexReader::open(&bytes);
+    let reader = CellIndexReader::open(&bytes).unwrap();
     let mut entry = CoveringCell {
         pcell: S2PaddedCell::<Plane>::new(id, 0.0),
         query_edges: vec![],

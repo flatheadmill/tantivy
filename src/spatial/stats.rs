@@ -4,6 +4,7 @@
 //! reports structure, not query results. It is intended for validating shape-changing index fixes.
 
 use std::collections::BTreeMap;
+use std::io;
 
 use serde::Serialize;
 
@@ -181,7 +182,7 @@ struct CellKey {
 }
 
 /// Compute sphere spatial stats from an opened per-field spatial reader.
-pub fn sphere_stats_for_reader(reader: &SpatialReader) -> SpatialStats {
+pub fn sphere_stats_for_reader(reader: &SpatialReader) -> io::Result<SpatialStats> {
     spatial_stats_for_slices::<Sphere>(
         reader.cells_bytes(),
         reader.edges_bytes(),
@@ -194,7 +195,7 @@ pub fn sphere_stats_for_slices(
     cells_bytes: &[u8],
     edges_bytes: &[u8],
     doc_ids_bytes: &[u8],
-) -> SpatialStats {
+) -> io::Result<SpatialStats> {
     spatial_stats_for_slices::<Sphere>(cells_bytes, edges_bytes, doc_ids_bytes)
 }
 
@@ -202,9 +203,9 @@ fn spatial_stats_for_slices<S: Surface>(
     cells_bytes: &[u8],
     edges_bytes: &[u8],
     doc_ids_bytes: &[u8],
-) -> SpatialStats {
+) -> io::Result<SpatialStats> {
     let options = ClipOptions::default();
-    let cell_reader = CellIndexReader::open_with_doc_ids(cells_bytes, doc_ids_bytes);
+    let cell_reader = CellIndexReader::open_with_doc_ids(cells_bytes, doc_ids_bytes)?;
     let edge_reader = EdgeReader::<S>::open(edges_bytes);
     let edge_cache = EdgeCache::new(vec![edge_reader], STATS_EDGE_CACHE_MAX_VERTICES);
 
@@ -314,7 +315,7 @@ fn spatial_stats_for_slices<S: Surface>(
         total_edge_refs as f64 / distinct as f64
     };
 
-    SpatialStats {
+    Ok(SpatialStats {
         options: StatsOptions {
             max_edges_per_cell: options.max_edges_per_cell,
             min_short_edge_fraction: options.min_short_edge_fraction,
@@ -337,7 +338,7 @@ fn spatial_stats_for_slices<S: Surface>(
             worst_cells: threshold_cells,
         },
         heaviest_cells,
-    }
+    })
 }
 
 impl CellKey {

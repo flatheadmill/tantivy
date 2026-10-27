@@ -4,7 +4,7 @@ use super::edge_crosser::EdgeCrosser;
 use super::r2rect::R2Rect;
 use super::s2cell_id::S2CellId;
 use super::s2padded_cell::S2PaddedCell;
-use super::surface::Surface;
+use super::surface::{cell_bound_uv, Surface};
 use crate::spatial::s2edge_clipping::clip_edge_bound;
 
 /// An entry in the covering descent. Carries the padded cell for splitting, the query edge
@@ -50,6 +50,20 @@ pub(crate) fn split_edges<S: Surface>(
     get_edge: &impl Fn(u32) -> (S::Point, S::Point),
 ) -> [[Vec<u32>; 2]; 2] {
     let face = pcell.id().face();
+    if S::EXACT_SUPPORT {
+        let mut child_edges: [[Vec<u32>; 2]; 2] = Default::default();
+        for pos in 0..4 {
+            let (i, j) = pcell.get_child_ij(pos);
+            let bound = cell_bound_uv::<S>(pcell.id().child(pos));
+            for &edge_idx in edges {
+                let (v0, v1) = get_edge(edge_idx);
+                if S::edge_intersects_rect(&v0, &v1, face, &bound) {
+                    child_edges[i][j].push(edge_idx);
+                }
+            }
+        }
+        return child_edges;
+    }
     let cell_bound = pcell.bound();
     let middle = pcell.middle();
     let u_mid_lo = middle[0].lo();

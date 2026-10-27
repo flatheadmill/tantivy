@@ -13,7 +13,7 @@ use super::s2edge_clipping::{
     interpolate_double, EDGE_CLIP_ERROR_UV_COORD, FACE_CLIP_ERROR_UV_COORD,
 };
 use super::s2padded_cell::S2PaddedCell;
-use super::surface::Surface;
+use super::surface::{cell_bound_uv, exact_edge_bound, Surface};
 use crate::spatial::shape_index::{ShapeCell, ShapeIndex};
 
 /// The amount by which cells are "padded" to compensate for numerical errors
@@ -324,6 +324,26 @@ impl<S: Surface> Clipper<S> {
         v1: &S::Point,
         face_edges: &mut [Vec<FaceEdge<S>>],
     ) {
+        if S::EXACT_SUPPORT {
+            for face in 0..S::FACE_COUNT {
+                let bound = cell_bound_uv::<S>(S2CellId::from_face(face));
+                if S::edge_intersects_rect(v0, v1, face, &bound) {
+                    let (a_u, a_v) = S::point_to_face_uv(face, v0);
+                    let (b_u, b_v) = S::point_to_face_uv(face, v1);
+                    face_edges[face as usize].push(FaceEdge {
+                        geometry_id,
+                        edge_index,
+                        max_level,
+                        has_interior,
+                        a: [a_u, a_v],
+                        b: [b_u, b_v],
+                        v0: *v0,
+                        v1: *v1,
+                    });
+                }
+            }
+            return;
+        }
         let a_face = S::get_face(v0);
         let b_face = S::get_face(v1);
 
@@ -389,13 +409,21 @@ impl<S: Surface> Clipper<S> {
         let pcell = S2PaddedCell::new(face_id, S::CELL_PADDING);
 
         if num_edges > 0 {
-            // shrink_to_fit skips empty levels of the hierarchy. If all edges on this face are
-            // clustered in a small region the recursion can start at level 10 instead of level 0.
-            // The edge bounds are not tightened to the shrunk cell. They keep their full
-            // from_point_pair extent. A wide bound means clip_to_children over-includes an edge in
-            // children it barely touches. Deeper levels filter out the extras. Over-inclusion is
-            // safe. Under-inclusion loses edges.
-            let shrunk_id = pcell.shrink_to_fit(&bound);
+            let mut shrunk_id = pcell.shrink_to_fit(&bound);
+            if S::EXACT_SUPPORT {
+                // An internal boundary contact also belongs to the neighboring closed cell.
+                // The face border is [-1, 1] in UV, as in cell_bound_uv.
+                while !shrunk_id.is_face() {
+                    let nominal = cell_bound_uv::<S>(shrunk_id);
+                    if (0..2).all(|axis| {
+                        (nominal[axis].lo() == -1.0 || bound[axis].lo() > nominal[axis].lo())
+                            && (nominal[axis].hi() == 1.0 || bound[axis].hi() < nominal[axis].hi())
+                    }) {
+                        break;
+                    }
+                    shrunk_id = shrunk_id.parent(shrunk_id.level() - 1);
+                }
+            }
             if shrunk_id != face_id {
                 // All the edges are contained by some descendant of the face cell. We can save a
                 // lot of work by starting directly with that cell, but if we are in the interior of
@@ -438,8 +466,6 @@ impl<S: Surface> Clipper<S> {
         }
 
         if self.should_subdivide(pcell, edges, face_edges, &self.tracker) {
-            let middle = pcell.middle();
-
             let mut child_edges: [[Vec<ClippedEdge>; 2]; 2] = Default::default();
             for i in 0..2 {
                 for j in 0..2 {
@@ -447,8 +473,28 @@ impl<S: Surface> Clipper<S> {
                 }
             }
 
-            for edge in edges.iter() {
-                self.clip_to_children(edge, &middle, face_edges, &mut child_edges);
+            if S::EXACT_SUPPORT {
+                for pos in 0..4 {
+                    let (i, j) = pcell.get_child_ij(pos);
+                    let nominal = cell_bound_uv::<S>(pcell.id().child(pos));
+                    for edge in edges.iter() {
+                        let fe = &face_edges[edge.face_edge_index];
+                        if let Some(bound) =
+                            exact_edge_bound::<S>(&fe.v0, &fe.v1, pcell.id().face(), &nominal)
+                        {
+                            child_edges[i][j].push(ClippedEdge {
+                                geometry_id: edge.geometry_id,
+                                face_edge_index: edge.face_edge_index,
+                                bound,
+                            });
+                        }
+                    }
+                }
+            } else {
+                let middle = pcell.middle();
+                for edge in edges.iter() {
+                    self.clip_to_children(edge, &middle, face_edges, &mut child_edges);
+                }
             }
 
             for pos in 0..4 {

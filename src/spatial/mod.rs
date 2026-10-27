@@ -73,3 +73,11 @@ pub use geometry::Geometry;
 
 #[cfg(test)]
 mod lifecycle_tests;
+
+#[cfg(test)]
+#[path = "tests/plane_support_tests.rs"]
+mod plane_support_tests;
+
+#[cfg(test)]
+#[path = "tests/footer_tests.rs"]
+mod footer_tests;

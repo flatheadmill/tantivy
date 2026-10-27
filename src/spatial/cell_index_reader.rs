@@ -4,9 +4,11 @@
 //! and the dictionary provides random access by cell_id. The cursor provides seekable access for
 //! the branch-and-bound traversal. The iterator walks cells in sorted order for merge.
 
+use std::io;
+
 use crate::spatial::clipped_shape::ClippedShape;
 use crate::spatial::s2cell_id::S2CellId;
-use crate::spatial::shape_index::ShapeCell;
+use crate::spatial::shape_index::{ShapeCell, CELL_FOOTER_LEN, CELL_MAGIC, CELL_REVISION};
 
 /// The relationship between a target cell and the index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,29 +31,55 @@ pub struct CellIndexReader<'a> {
 
 impl<'a> CellIndexReader<'a> {
     /// Opens a cell index reader from the raw bytes of a serialized cell index.
-    pub fn open(data: &'a [u8]) -> Self {
+    pub fn open(data: &'a [u8]) -> io::Result<Self> {
         Self::open_with_doc_ids(data, &[])
     }
 
     /// Opens a cell index reader with an associated doc_id file.
-    pub fn open_with_doc_ids(data: &'a [u8], doc_ids_data: &'a [u8]) -> Self {
-        if data.len() < 12 {
-            return CellIndexReader {
+    pub fn open_with_doc_ids(data: &'a [u8], doc_ids_data: &'a [u8]) -> io::Result<Self> {
+        if data.is_empty() {
+            return Ok(CellIndexReader {
                 data,
                 doc_ids_data,
                 cell_count: 0,
                 dir_offset: 0,
-            };
+            });
         }
         let n = data.len();
-        let dir_offset = u64::from_le_bytes(data[n - 8..n].try_into().unwrap());
-        let cell_count = u32::from_le_bytes(data[n - 12..n - 8].try_into().unwrap());
-        CellIndexReader {
+        if n < CELL_FOOTER_LEN || &data[n - 8..n - 4] != CELL_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unrecognized spatial cell format; rebuild the spatial index",
+            ));
+        }
+        let revision = u32::from_le_bytes(data[n - 4..n].try_into().unwrap());
+        if revision != CELL_REVISION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "spatial cell revision {revision} is unsupported (expected {CELL_REVISION}); \
+                     rebuild the spatial index"
+                ),
+            ));
+        }
+        let start = n - CELL_FOOTER_LEN;
+        let cell_count = u32::from_le_bytes(data[start..start + 4].try_into().unwrap());
+        let dir_offset = u64::from_le_bytes(data[start + 4..start + 12].try_into().unwrap());
+        let dir_end = u64::from(cell_count)
+            .checked_mul(24)
+            .and_then(|len| dir_offset.checked_add(len));
+        if dir_end != Some(start as u64) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid spatial cell directory; rebuild the spatial index",
+            ));
+        }
+        Ok(CellIndexReader {
             data,
             doc_ids_data,
             cell_count,
             dir_offset,
-        }
+        })
     }
 
     /// Visit doc_ids for cells in the range [start, end). Calls the visitor for each doc_id.

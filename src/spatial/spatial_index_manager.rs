@@ -29,6 +29,7 @@ use crate::spatial::interleaver::Interleaver;
 use crate::spatial::intersects::Intersects;
 use crate::spatial::plane::Plane;
 use crate::spatial::region_coverer::CovererOptions;
+use crate::spatial::shape_index::write_cell_footer;
 use crate::spatial::sphere::Sphere;
 use crate::spatial::surface::Surface;
 use crate::spatial::within::Within;
@@ -91,7 +92,7 @@ pub trait PreparedSpatialQuery: Send + Sync {
         edges_bytes: &[u8],
         doc_ids_bytes: &[u8],
         max_doc: u32,
-    ) -> BitSet;
+    ) -> io::Result<BitSet>;
 }
 
 /// Result of a spatial merge.
@@ -175,7 +176,7 @@ impl<S: Surface + Send + Sync + Clone + 'static> SpatialIndex for SurfaceIndex<S
         let mut segment_names: Vec<String> = Vec::new();
 
         for source in sources {
-            let cr = CellIndexReader::open(source.cells_bytes);
+            let cr = CellIndexReader::open(source.cells_bytes)?;
             let er = EdgeReader::<S>::open(source.edges_bytes);
             geometry_counts.push(er.geometry_count());
             cell_readers.push(cr);
@@ -260,8 +261,6 @@ impl<S: Surface + Send + Sync + Clone + 'static> SpatialIndex for SurfaceIndex<S
         assert_eq!(next_new_id, edge_writer.geometry_count(),);
         edge_writer.finish();
 
-        interleave.report();
-
         // Cell index dictionary and footer.
         let dir_offset = cells_write.written_bytes() - cells_base;
         for &(cell_id, offset, doc_id_offset) in &offsets {
@@ -269,10 +268,7 @@ impl<S: Surface + Send + Sync + Clone + 'static> SpatialIndex for SurfaceIndex<S
             cells_write.write_all(&offset.to_le_bytes()).unwrap();
             cells_write.write_all(&doc_id_offset.to_le_bytes()).unwrap();
         }
-        cells_write
-            .write_all(&(cell_count as u32).to_le_bytes())
-            .unwrap();
-        cells_write.write_all(&dir_offset.to_le_bytes()).unwrap();
+        write_cell_footer(cells_write, cell_count as u32, dir_offset)?;
         cells_write.flush()?;
         edges_write.flush()?;
         doc_ids_write.flush()?;
@@ -332,12 +328,13 @@ impl<S: Surface + 'static> PreparedSpatialQuery for PreparedIntersects<S> {
         edges_bytes: &[u8],
         doc_ids_bytes: &[u8],
         max_doc: u32,
-    ) -> BitSet {
-        let cell_reader = CellIndexReader::open_with_doc_ids(cells_bytes, doc_ids_bytes);
+    ) -> io::Result<BitSet> {
+        let cell_reader = CellIndexReader::open_with_doc_ids(cells_bytes, doc_ids_bytes)?;
         let edge_reader = EdgeReader::<S>::open(edges_bytes);
         let mut edge_cache = EdgeCache::new(vec![edge_reader], 100_000);
-        self.query
-            .search(&cell_reader, None, &mut edge_cache, max_doc)
+        Ok(self
+            .query
+            .search(&cell_reader, None, &mut edge_cache, max_doc))
     }
 }
 
@@ -352,12 +349,13 @@ impl<S: Surface + 'static> PreparedSpatialQuery for PreparedContainsNew<S> {
         edges_bytes: &[u8],
         doc_ids_bytes: &[u8],
         max_doc: u32,
-    ) -> BitSet {
-        let cell_reader = CellIndexReader::open_with_doc_ids(cells_bytes, doc_ids_bytes);
+    ) -> io::Result<BitSet> {
+        let cell_reader = CellIndexReader::open_with_doc_ids(cells_bytes, doc_ids_bytes)?;
         let edge_reader = EdgeReader::<S>::open(edges_bytes);
         let mut edge_cache = EdgeCache::new(vec![edge_reader], 100_000);
-        self.query
-            .search(&cell_reader, None, &mut edge_cache, max_doc)
+        Ok(self
+            .query
+            .search(&cell_reader, None, &mut edge_cache, max_doc))
     }
 }
 
@@ -372,12 +370,13 @@ impl<S: Surface + 'static> PreparedSpatialQuery for PreparedWithin<S> {
         edges_bytes: &[u8],
         doc_ids_bytes: &[u8],
         max_doc: u32,
-    ) -> BitSet {
-        let cell_reader = CellIndexReader::open_with_doc_ids(cells_bytes, doc_ids_bytes);
+    ) -> io::Result<BitSet> {
+        let cell_reader = CellIndexReader::open_with_doc_ids(cells_bytes, doc_ids_bytes)?;
         let edge_reader = EdgeReader::<S>::open(edges_bytes);
         let mut edge_cache = EdgeCache::new(vec![edge_reader], 100_000);
-        self.query
-            .search(&cell_reader, None, &mut edge_cache, max_doc)
+        Ok(self
+            .query
+            .search(&cell_reader, None, &mut edge_cache, max_doc))
     }
 }
 
@@ -392,12 +391,13 @@ impl<S: Surface + 'static> PreparedSpatialQuery for PreparedDistance<S> {
         edges_bytes: &[u8],
         doc_ids_bytes: &[u8],
         max_doc: u32,
-    ) -> BitSet {
-        let cell_reader = CellIndexReader::open_with_doc_ids(cells_bytes, doc_ids_bytes);
+    ) -> io::Result<BitSet> {
+        let cell_reader = CellIndexReader::open_with_doc_ids(cells_bytes, doc_ids_bytes)?;
         let edge_reader = EdgeReader::<S>::open(edges_bytes);
         let mut edge_cache = EdgeCache::new(vec![edge_reader], 100_000);
-        self.query
-            .search(&cell_reader, None, &mut edge_cache, max_doc)
+        Ok(self
+            .query
+            .search(&cell_reader, None, &mut edge_cache, max_doc))
     }
 }
 
