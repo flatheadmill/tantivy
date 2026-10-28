@@ -1,6 +1,7 @@
-//! Polygon-intersects-polygon query.
+//! Intersects query over the field's surface.
 //!
-//! Single-pass query using bitsets for bookkeeping. For each candidate geometry encountered during
+//! Plane decides the relation over complete values with boundary-inclusive contact.
+//! Sphere uses the covering walk below. For each candidate geometry encountered during
 //! the covering walk: first-encounter containment tests (both directions), then edge crossing tests
 //! in every cell where the geometry appears. A hit bitset skips confirmed geometries. A
 //! containment-tested bitset ensures the containment tests run at most once per geometry.
@@ -15,6 +16,8 @@ use super::edge_cache::EdgeCache;
 use super::edge_crosser::EdgeCrosser;
 use super::edge_provider::EdgeProvider;
 use super::geometry_set::GeometrySet;
+use super::plane::query::PlaneQuery;
+use super::plane::Predicate;
 use super::query_edge_provider::QueryEdgeProvider;
 use super::region_coverer::CovererOptions;
 use super::s2cell_id::S2CellId;
@@ -25,8 +28,9 @@ use crate::spatial::clip_options::ClipOptions;
 use crate::spatial::clipper::Clipper;
 use crate::spatial::shape_index::ShapeIndex;
 
-/// Prepared intersects query, built once from a query polygon and applied per-segment.
+/// Prepared intersects query, built once from a geometry and applied per segment.
 pub struct Intersects<S: Surface> {
+    plane: Option<PlaneQuery>,
     query_index: ShapeIndex,
     query_edges: QueryEdgeProvider<S>,
 }
@@ -35,11 +39,17 @@ impl<S: Surface> Intersects<S> {
     /// Build the query from a smashed GeometrySet.
     pub fn new(set: GeometrySet<S>, _options: CovererOptions) -> Self {
         let builder = Clipper::new(ClipOptions::default());
-        let query_index = builder.build(std::slice::from_ref(&set));
+        let plane = PlaneQuery::prepare(&set);
+        let query_index = if plane.is_some() {
+            ShapeIndex::default()
+        } else {
+            builder.build(std::slice::from_ref(&set))
+        };
 
         let query_edges = QueryEdgeProvider { set };
 
         Self {
+            plane,
             query_index,
             query_edges,
         }
@@ -56,7 +66,7 @@ impl<S: Surface> Intersects<S> {
         })
     }
 
-    /// Search one segment for geometries that intersect the query polygon.
+    /// Search one segment for geometries that intersect the query.
     pub fn search<'a>(
         &self,
         reader: &'a CellIndexReader<'a>,
@@ -64,6 +74,16 @@ impl<S: Surface> Intersects<S> {
         edge_cache: &mut EdgeCache<'a, S>,
         max_doc: u32,
     ) -> BitSet {
+        if let Some(plane) = &self.plane {
+            return plane.search(
+                reader,
+                terms_filter,
+                edge_cache,
+                max_doc,
+                Predicate::Intersects,
+                false,
+            );
+        }
         let geometry_count = edge_cache.geometry_count(0);
         let mut seen = BitSet::with_max_value(geometry_count);
         let mut doc_ids = BitSet::with_max_value(max_doc);
@@ -185,7 +205,11 @@ impl<S: Surface> Intersects<S> {
                 };
                 let parent_center = entry.pcell.get_center();
                 let mut children = covering_split(&entry, &get_edge, &start_for_cell);
-                covering_contains_center::<S>(&parent_center, &mut children, &get_edge);
+                covering_contains_center::<S>(&parent_center, &mut children, &get_edge, &|point| {
+                    self.query_edges
+                        .get_edge_set((0, member))
+                        .contains_point(point)
+                });
                 for child in children {
                     heap.push((child, member));
                 }

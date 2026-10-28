@@ -1,6 +1,6 @@
 //! Spatial polygon query.
 //!
-//! Finds indexed geometries that match a query polygon via contains or intersects predicates. The
+//! Finds indexed geometries that match a query polygon under the selected predicate. The
 //! query polygon is specified as lon/lat vertices, projected onto the surface configured for the
 //! field, and searched against each segment's cell index and edge index.
 
@@ -17,11 +17,13 @@ use crate::{DocId, DocSet, Score, TERMINATED};
 /// The spatial predicate to apply.
 #[derive(Clone, Debug)]
 pub enum SpatialPredicate {
-    /// Return geometries contained by the query polygon.
+    /// Return geometries that contain the query, with a common interior on Plane.
     Contains,
+    /// Return Plane geometries that cover every point of the nonempty query.
+    Covers,
     /// Return geometries that intersect the query polygon.
     Intersects,
-    /// Return geometries entirely inside the query polygon (ST_Within).
+    /// Return geometries covered by the query, including its boundary on Plane.
     CoveredBy,
     /// Return geometries within a distance of a query polygon. Distance in radians.
     DistanceWithin(f64),
@@ -32,7 +34,7 @@ pub enum SpatialPredicate {
 pub struct SpatialQuery {
     field: Field,
     predicate: SpatialPredicate,
-    /// Polygon vertices (lon/lat) for Contains and Intersects, or a single point for distance.
+    /// Polygon vertices (lon/lat), or a single point for distance.
     coordinates: Vec<[f64; 2]>,
 }
 
@@ -101,7 +103,12 @@ impl Query for SpatialQuery {
         if ring.first() != ring.last() {
             ring.push(ring[0]);
         }
-        let plane_geometry = Geometry::<Plane>::Polygon(vec![ring]);
+        let plane_geometry =
+            if matches!(self.predicate, SpatialPredicate::DistanceWithin(_)) && ring.len() == 1 {
+                Geometry::<Plane>::Point(ring[0])
+            } else {
+                Geometry::<Plane>::Polygon(vec![ring])
+            };
 
         let prepared: Box<dyn PreparedSpatialQuery> = match &self.predicate {
             _ => {
@@ -128,9 +135,10 @@ impl Query for SpatialQuery {
                         spatial_index.prepare_intersects(&plane_geometry)
                     }
                     SpatialPredicate::Contains => spatial_index.prepare_contains(&plane_geometry),
+                    SpatialPredicate::Covers => spatial_index.prepare_covers(&plane_geometry)?,
                     SpatialPredicate::CoveredBy => spatial_index.prepare_within(&plane_geometry),
                     SpatialPredicate::DistanceWithin(radians) => {
-                        spatial_index.prepare_distance(&plane_geometry, *radians)
+                        spatial_index.prepare_distance(&plane_geometry, *radians)?
                     }
                 }
             }

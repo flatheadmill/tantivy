@@ -440,6 +440,8 @@ fn spatial_start(inp: &str) -> IResult<&str, &str> {
         alt((
             tag("$intersects"),
             tag("$contains"),
+            tag("$covers"),
+            tag("$coveredby"),
             tag("$within"),
             tag("$between"),
             tag("$knn"),
@@ -456,6 +458,8 @@ fn spatial_parameters<'a>(inp: &'a str, name: &str) -> IResult<&'a str, SpatialP
     match name {
         "$intersects" => Ok((inp, SpatialPredicateKind::Intersects)),
         "$contains" => Ok((inp, SpatialPredicateKind::Contains)),
+        "$covers" => Ok((inp, SpatialPredicateKind::Covers)),
+        "$coveredby" => Ok((inp, SpatialPredicateKind::CoveredBy)),
         "$within" => map(terminated(spatial_distance, spatial_comma), |radius| {
             SpatialPredicateKind::Within(radius.into())
         })(inp),
@@ -480,7 +484,10 @@ fn spatial_coordinates<'a>(
     let coord_pair = separated_pair(spatial_float, multispace1, spatial_float);
     if matches!(
         predicate,
-        SpatialPredicateKind::Intersects | SpatialPredicateKind::Contains
+        SpatialPredicateKind::Intersects
+            | SpatialPredicateKind::Contains
+            | SpatialPredicateKind::Covers
+            | SpatialPredicateKind::CoveredBy
     ) {
         verify(
             separated_list0(spatial_comma, coord_pair),

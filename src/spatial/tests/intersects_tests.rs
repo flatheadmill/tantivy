@@ -105,6 +105,13 @@ fn query<S: Surface>(geometries: Vec<Geometry<S>>) -> Intersects<S> {
     )
 }
 
+fn query_index<S: Surface>(query: &Intersects<S>) -> &ShapeIndex {
+    query
+        .plane
+        .as_ref()
+        .map_or(&query.query_index, |plane| plane.index())
+}
+
 fn inside<S: Surface>(point: &S::Point, member: &EdgeSet<S>) -> bool {
     if !member.closed {
         return false;
@@ -125,10 +132,10 @@ fn check_later_member_crossing<S: Surface + Clone>() {
     let fixture = Fixture::new(&[rectangle::<S>(0.29, 0.25, 0.31, 0.45)]);
     let candidate = &fixture.sets[0].members[0];
     let multipart = query(vec![first.clone(), second.clone()]);
-    assert_eq!(multipart.query_index.cells.len(), 1);
+    assert_eq!(query_index(&multipart).cells.len(), 1);
     assert_eq!(fixture.reader().cell_count(), 1);
     assert!(
-        multipart.query_index.cells[0].cell_id.level() < fixture.reader().cell_id_at(0).level()
+        query_index(&multipart).cells[0].cell_id.level() < fixture.reader().cell_id_at(0).level()
     );
     for member in &multipart.query_edges.set.members {
         assert!(member.vertices.iter().all(|p| !inside::<S>(p, candidate)));
@@ -170,9 +177,9 @@ fn check_later_member_containment<S: Surface + Clone>() {
         rectangle::<S>(-0.7, -0.7, -0.6, -0.6),
     ]);
     let multipart = query(vec![first.clone(), second.clone()]);
-    assert_eq!(multipart.query_index.cells.len(), 1);
+    assert_eq!(query_index(&multipart).cells.len(), 1);
     assert_eq!(fixture.reader().cell_count(), 1);
-    let cell = &multipart.query_index.cells[0];
+    let cell = &query_index(&multipart).cells[0];
     assert!(!cell.shapes.iter().all(|s| s.edge_indices.is_empty()));
     assert!(fixture.reader().cell_id_at(0).level() <= cell.cell_id.level());
     assert!(!inside::<S>(&point, &multipart.query_edges.set.members[0]));
@@ -183,7 +190,7 @@ fn check_later_member_containment<S: Surface + Clone>() {
     fixture.check(&query(vec![first.clone()]), &[]);
     fixture.check(&multipart, &[0]);
     let reversed = query(vec![second, first]);
-    let reversed_cell = &reversed.query_index.cells[0];
+    let reversed_cell = &query_index(&reversed).cells[0];
     let mut heap = BinaryHeap::new();
     for shape in &reversed_cell.shapes {
         heap.push((
@@ -232,8 +239,8 @@ fn test_overlapping_members_have_separate_interiors() {
     let b = rectangle::<Plane>(-0.2, 0.2, 0.6, 0.9);
     let fixture = Fixture::new(&[rectangle::<Plane>(0.29, 0.39, 0.31, 0.41)]);
     let multipart = query(vec![a.clone(), b.clone()]);
-    assert_eq!(multipart.query_index.cells.len(), 1);
-    let cell = &multipart.query_index.cells[0];
+    assert_eq!(query_index(&multipart).cells.len(), 1);
+    let cell = &query_index(&multipart).cells[0];
     assert_eq!(cell.cell_id, S2CellId::from_face(0));
     assert_eq!(fixture.reader().cell_count(), 1);
     let candidate_cell = fixture.reader().cell_id_at(0);

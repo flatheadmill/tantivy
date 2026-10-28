@@ -939,9 +939,6 @@ impl QueryParser {
                     );
                 }
                 let unsupported = match (&predicate, inner_query.is_some()) {
-                    (SpatialPredicateKind::Contains, true) => {
-                        Some("$contains joins are not supported.")
-                    }
                     (SpatialPredicateKind::Between(_, _), _) => Some("$between is not supported."),
                     (SpatialPredicateKind::Knn(_), _) => Some("$knn is not supported."),
                     _ => None,
@@ -1072,10 +1069,11 @@ fn convert_literal_to_query(
             if let Some(inner_ast) = inner_query {
                 let relation = match predicate {
                     SpatialPredicateKind::Intersects => SpatialRelation::Intersects,
+                    SpatialPredicateKind::Contains => SpatialRelation::Contains,
+                    SpatialPredicateKind::Covers => SpatialRelation::Covers,
+                    SpatialPredicateKind::CoveredBy => SpatialRelation::CoveredBy,
                     SpatialPredicateKind::Within(r) => SpatialRelation::Near(r.0),
-                    SpatialPredicateKind::Contains
-                    | SpatialPredicateKind::Between(_, _)
-                    | SpatialPredicateKind::Knn(_) => {
+                    SpatialPredicateKind::Between(_, _) | SpatialPredicateKind::Knn(_) => {
                         unreachable!("rejected during spatial resolution")
                     }
                 };
@@ -1100,6 +1098,8 @@ fn convert_literal_to_query(
                 let spatial_predicate = match predicate {
                     SpatialPredicateKind::Intersects => SpatialPredicate::Intersects,
                     SpatialPredicateKind::Contains => SpatialPredicate::Contains,
+                    SpatialPredicateKind::Covers => SpatialPredicate::Covers,
+                    SpatialPredicateKind::CoveredBy => SpatialPredicate::CoveredBy,
                     SpatialPredicateKind::Within(r) => SpatialPredicate::DistanceWithin(r.0),
                     SpatialPredicateKind::Between(_, _) | SpatialPredicateKind::Knn(_) => {
                         unreachable!("rejected during spatial resolution")
@@ -2645,6 +2645,8 @@ mod test {
         for text in [
             "geometry:$intersects(0 0, 1 0, 0 1)",
             "geometry:$contains(0 0, 1 0, 0 1)",
+            "geometry:$covers(0 0, 1 0, 0 1)",
+            "geometry:$coveredby(0 0, 1 0, 0 1)",
             "geometry:$within(1km, 0 0)",
         ] {
             let ast = query_grammar::parse_query(text).unwrap();

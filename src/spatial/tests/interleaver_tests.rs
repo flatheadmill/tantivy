@@ -23,6 +23,52 @@ struct Fixture<S: Surface> {
     edges: Vec<u8>,
 }
 
+#[test]
+fn test_plane_source_coordinates_and_member_types_round_trip() {
+    use crate::spatial::geometry_set::GeometryKind;
+    let point = [(-73.0f64).next_up(), 40.0f64.next_down()];
+    let geometry = Geometry::<Plane>::GeometryCollection(vec![
+        Geometry::Point(point),
+        Geometry::LineString(vec![point]),
+        Geometry::LineString(Vec::new()),
+        Geometry::Polygon(Vec::new()),
+        Geometry::Polygon(vec![vec![point; 4]]),
+    ])
+    .project::<Plane>();
+    let set = to_geometry_set(&geometry, 7);
+    let fixture = Fixture::new(vec![set], ShapeIndex { cells: Vec::new() });
+    let reader = EdgeReader::<Plane>::open(&fixture.edges);
+    for position in 0..5 {
+        let (head, restored) = reader.read_geometry_set(position);
+        assert_eq!(head, 0);
+        assert_eq!(restored.doc_id, 7);
+        assert_eq!(
+            restored
+                .members
+                .iter()
+                .map(|member| member.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                GeometryKind::Point,
+                GeometryKind::LineString,
+                GeometryKind::LineString,
+                GeometryKind::Polygon,
+                GeometryKind::Polygon,
+            ]
+        );
+        assert_eq!(
+            restored.members[0].vertices[0].map(f64::to_bits),
+            point.map(f64::to_bits)
+        );
+        assert_eq!(
+            restored.members[1].vertices[0].map(f64::to_bits),
+            point.map(f64::to_bits)
+        );
+        assert!(restored.members[2].vertices.is_empty());
+        assert!(restored.members[3].vertices.is_empty());
+    }
+}
+
 impl<S: Surface> Fixture<S> {
     fn new(sets: Vec<GeometrySet<S>>, index: ShapeIndex) -> Self {
         let mut cells = CountingWriter::wrap(Vec::new());
@@ -99,14 +145,21 @@ fn arrival_fixtures(finer_j: bool, diagonal: bool) -> Vec<Fixture<Plane>> {
         )
     };
     let g = Fixture::new(
-        vec![to_geometry_set(&Geometry::LineString(line), 0)],
+        vec![to_geometry_set(
+            &Geometry::LineString(
+                line.into_iter()
+                    .map(|p| Plane::face_uv_to_point(0, p[0], p[1]))
+                    .collect(),
+            ),
+            0,
+        )],
         ShapeIndex {
             cells: paths.iter().map(|p| cell(path(p), 0..1)).collect(),
         },
     );
     let points = (1..=6)
         .chain(9..=14)
-        .map(|x| [x as f64 / 16.0, 0.375])
+        .map(|x| Plane::face_uv_to_point(0, x as f64 / 16.0, 0.375))
         .collect();
     let h = Fixture::new(
         vec![to_geometry_set(&Geometry::MultiPoint(points), 1)],
@@ -115,7 +168,10 @@ fn arrival_fixtures(finer_j: bool, diagonal: bool) -> Vec<Fixture<Plane>> {
         },
     );
     let j = Fixture::new(
-        vec![to_geometry_set(&Geometry::Point([0.4375, 0.125]), 2)],
+        vec![to_geometry_set(
+            &Geometry::Point(Plane::face_uv_to_point(0, 0.4375, 0.125)),
+            2,
+        )],
         ShapeIndex {
             cells: vec![cell(path(if finer_j { &[2, 0] } else { &[2] }), 0..1)],
         },
@@ -142,8 +198,8 @@ fn absorb<S: Surface>(sponge: &mut SpongeCell<S>, cell: &ShapeCell, cache: &Edge
     sponge.absorb_index_cell_edges(cell, cache);
 }
 
-fn split<S: Surface>(sponge: SpongeCell<S>) -> Vec<SpongeCell<S>> {
-    coarse_split(sponge, &mut 0, &mut 0, &[])
+fn split<S: Surface>(sponge: SpongeCell<S>, cache: &EdgeCache<'_, S>) -> Vec<SpongeCell<S>> {
+    coarse_split(sponge, cache, &mut 0, &mut 0, &[])
         .into_iter()
         .map(|entry| match entry {
             HeapEntry::Sponge(s) => s,
@@ -272,7 +328,7 @@ fn test_plane_equal_cell_absorption_orders() {
         let mut root = sponge::<Plane>(path(&[]));
         absorb(&mut root, &fixtures[1].source_cell(0, 1), &cache);
         absorb(&mut root, &fixtures[0].source_cell(0, 0), &cache);
-        let mut children = split(root);
+        let mut children = split(root, &cache);
         let upper = children.remove(
             children
                 .iter()
@@ -292,7 +348,7 @@ fn test_plane_equal_cell_absorption_orders() {
         };
         check_counts(&upper);
         assert_eq!(upper.edge_count, 13);
-        let mut grandchildren = split(upper);
+        let mut grandchildren = split(upper, &cache);
         for (child_id, source_indices, count) in
             [(path(&[2, 0]), [1, 2], 8), (path(&[2, 3]), [3, 4], 7)]
         {
@@ -325,7 +381,7 @@ fn test_plane_equal_cell_absorption_orders() {
         children.extend(grandchildren);
         let mut cells: Vec<_> = children
             .into_iter()
-            .map(|s| flatten(HeapEntry::Sponge(s)).unwrap())
+            .map(|s| flatten(HeapEntry::Sponge(s), &cache).unwrap())
             .collect();
         cells.sort_unstable_by_key(|c| c.cell_id);
         let members: Vec<_> = fixtures
@@ -374,7 +430,8 @@ fn test_plane_containing_cell_absorbs_sponge() {
             .unwrap();
         assert_eq!(
             edge.bound,
-            R2Rect::from_point_pair(edge.v0, edge.v1).intersection(&nominal_bound(containing))
+            Plane::edge_bound_uv(&edge.v0, &edge.v1, 0)
+                .intersection(&cell_bound_uv::<Plane>(containing))
         );
         assert_eq!(
             parent
@@ -384,7 +441,7 @@ fn test_plane_containing_cell_absorbs_sponge() {
                 .count(),
             2
         );
-        let output = flatten(HeapEntry::Sponge(parent)).unwrap();
+        let output = flatten(HeapEntry::Sponge(parent), &cache).unwrap();
         let mut cells = Vec::new();
         if !containing.is_face() {
             cells.push(fixtures[0].source_cell(0, 0));
@@ -505,7 +562,7 @@ fn test_plane_rejects_disjoint_stored_occurrence() {
         || target.absorb_sponge_cell_edges(&invalid)
     ))
     .is_err());
-    assert!(catch_unwind(AssertUnwindSafe(|| split(invalid))).is_err());
+    assert!(catch_unwind(AssertUnwindSafe(|| split(invalid, &cache))).is_err());
 }
 
 #[test]
@@ -519,7 +576,11 @@ fn test_false_fine_anchor_checked_in_both_orders() {
         if reverse {
             s.anchors.reverse();
         }
-        assert!(catch_unwind(AssertUnwindSafe(|| split(s))).is_err());
+        assert!(catch_unwind(AssertUnwindSafe(|| split(
+            s,
+            &EdgeCache::new(Vec::new(), 0)
+        )))
+        .is_err());
     }
 }
 
@@ -531,7 +592,11 @@ fn test_split_rejects_mixed_or_duplicate_parent_anchors() {
             anchor((0, 0), path(&[]), true),
             anchor((0, 0), second, true),
         ];
-        assert!(catch_unwind(AssertUnwindSafe(|| split(s))).is_err());
+        assert!(catch_unwind(AssertUnwindSafe(|| split(
+            s,
+            &EdgeCache::new(Vec::new(), 0)
+        )))
+        .is_err());
     }
 }
 
@@ -549,7 +614,11 @@ fn test_flatten_rejects_unmatched_edge_groups() {
             point_edge((0, orphan)),
         ];
         s.edges.sort_unstable_by_key(|e| e.geometry_id);
-        assert!(catch_unwind(AssertUnwindSafe(|| flatten(HeapEntry::Sponge(s)))).is_err());
+        assert!(catch_unwind(AssertUnwindSafe(|| flatten(
+            HeapEntry::Sponge(s),
+            &EdgeCache::new(Vec::new(), 0)
+        )))
+        .is_err());
     }
 }
 
@@ -603,14 +672,14 @@ fn test_sphere_drops_unanchored_conservative_extra() {
         clip_to_children(&clipped, &flat, &padded.middle(), &mut nominations);
         let (i, j) = padded.get_child_ij(2);
         assert_eq!(nominations[i][j].len(), 1);
-        let children = split(root);
+        let children = split(root, &cache);
         let right = children.iter().find(|s| s.cell_id == path(&[2])).unwrap();
         assert_eq!(right.edges.len(), 1);
         assert_eq!(right.edge_count, 1);
         assert_eq!(right.edges[0].geometry_id, (h, 0));
         assert_eq!(right.anchors.len(), 1);
         for child in children {
-            flatten(HeapEntry::Sponge(child)).unwrap();
+            flatten(HeapEntry::Sponge(child), &cache).unwrap();
         }
     }
 }
@@ -800,14 +869,14 @@ fn test_plane_fine_anchor_group_keeps_both_centers() {
                 geometry_id: (0, 0),
                 edge_index,
                 max_level: get_edge_max_level::<Plane>(&a, &b),
-                v0: a,
-                v1: b,
+                v0: Plane::face_uv_to_point(0, a[0], a[1]),
+                v1: Plane::face_uv_to_point(0, b[0], b[1]),
                 a_uv: a,
                 b_uv: b,
                 bound: R2Rect::from_point_pair(a, b),
             });
         }
-        let children = split(s);
+        let children = split(s, &EdgeCache::new(Vec::new(), 0));
         let child = children.iter().find(|s| s.cell_id == path(&[2])).unwrap();
         check_counts(child);
         assert_eq!(child.edge_count, 2);

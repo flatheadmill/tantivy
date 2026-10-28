@@ -11,6 +11,8 @@ use crate::Occur;
 pub enum SpatialPredicateKind {
     Intersects,
     Contains,
+    Covers,
+    CoveredBy,
     Within(ordered_float::OrderedFloat<f64>),
     Between(
         ordered_float::OrderedFloat<f64>,
@@ -170,6 +172,8 @@ impl Debug for UserInputLeaf {
                     SpatialPredicateKind::Contains => {
                         write!(formatter, "$contains(")?;
                     }
+                    SpatialPredicateKind::Covers => write!(formatter, "$covers(")?,
+                    SpatialPredicateKind::CoveredBy => write!(formatter, "$coveredby(")?,
                     SpatialPredicateKind::Within(radius) => {
                         write!(formatter, "$within({}rad, ", radius.0)?;
                     }

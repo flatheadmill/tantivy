@@ -6,13 +6,14 @@
 //!
 //! Geometry entry format per 004_edge_index.md:
 //!   flags (u8): bit 0 = closed, bit 1 = contains_hilbert_start, bit 2 = has_holes, bit 3 = is_head
+//!               bit 4 = line string (retained for collapsed chains)
 //!   len (u32): byte length of data section
 //!   Head: [flags] [len] [doc_id] [ring boundaries?] [vertex data]
 //!   Member: [flags] [len] [ring boundaries?] [vertex data]
 
 use std::marker::PhantomData;
 
-use super::geometry_set::{EdgeSet, GeometrySet};
+use super::geometry_set::{EdgeSet, GeometryKind, GeometrySet};
 use super::surface::Surface;
 
 /// A located geometry entry. Holds a reference to the raw vertex data in the mmap'd slice.
@@ -70,6 +71,7 @@ impl<'a, S: Surface> LocatedEntry<'a, S> {
 }
 
 struct EntryHeader {
+    kind: GeometryKind,
     data_len: u32,
     closed: bool,
     contains_hilbert_start: bool,
@@ -122,6 +124,12 @@ impl<'a, S: Surface> EdgeReader<'a, S> {
     /// Total number of geometry entries in this segment.
     pub fn geometry_count(&self) -> u32 {
         self.geometry_count
+    }
+
+    /// Return the value head and document owning a member, without decoding vertices.
+    pub fn value_id(&self, position: u32) -> (u32, u32) {
+        let (head, _, doc_id) = self.find_head(position);
+        (head, doc_id)
     }
 
     /// Resolve a geometry position to its doc_id without decoding vertices.
@@ -192,6 +200,7 @@ impl<'a, S: Surface> EdgeReader<'a, S> {
             offsets.push(vertices.len());
 
             members.push(EdgeSet {
+                kind: h.kind,
                 vertices,
                 closed: h.closed,
                 contains_hilbert_start: h.contains_hilbert_start,
@@ -296,6 +305,13 @@ impl<'a, S: Surface> EdgeReader<'a, S> {
         let flags = self.data[o];
         let data_len = u32::from_le_bytes(self.data[o + 1..o + 5].try_into().unwrap());
         EntryHeader {
+            kind: if flags & 0x01 != 0 {
+                GeometryKind::Polygon
+            } else if flags & 0x10 != 0 {
+                GeometryKind::LineString
+            } else {
+                GeometryKind::Point
+            },
             data_len,
             closed: flags & 0x01 != 0,
             contains_hilbert_start: flags & 0x02 != 0,

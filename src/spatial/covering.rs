@@ -190,14 +190,19 @@ pub(crate) fn covering_contains_center<S: Surface>(
     parent_center: &S::Point,
     children: &mut [CoveringCell<S>],
     get_edge: &impl Fn(u32) -> (S::Point, S::Point),
+    contains_point: &impl Fn(&S::Point) -> bool,
 ) {
     for child in children.iter_mut() {
         if child.query_edges.is_empty() {
             continue;
         }
         let child_center = child.pcell.get_center();
-        child.contains_center ^=
-            crossing_parity::<S>(parent_center, &child_center, &child.query_edges, get_edge);
+        if S::RING_ROLES {
+            child.contains_center = contains_point(&child_center);
+        } else {
+            child.contains_center ^=
+                crossing_parity::<S>(parent_center, &child_center, &child.query_edges, get_edge);
+        }
     }
 }
 

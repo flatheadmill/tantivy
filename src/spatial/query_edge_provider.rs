@@ -20,6 +20,10 @@ impl<S: Surface> QueryEdgeProvider<S> {
 
 impl<S: Surface> EdgeProvider for QueryEdgeProvider<S> {
     type Point = S::Point;
+    fn contains_polygon_point(&self, geometry_id: GeometryId, point: &S::Point) -> bool {
+        self.get_edge_set(geometry_id).contains_point(point)
+    }
+
     fn get_edge(&self, geometry_id: GeometryId, edge_idx: u32) -> (S::Point, S::Point) {
         let vertices = &self.set.members[geometry_id.1 as usize].vertices;
         let i = edge_idx as usize;

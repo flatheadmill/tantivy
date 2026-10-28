@@ -261,7 +261,6 @@ fn test_plane_contains_excludes_crossing_at_dividers() {
 }
 
 #[test]
-#[ignore = "Contains misses exclusion crossings through candidate vertices"]
 fn test_plane_contains_crosses_candidate_vertices() {
     check_contains::<Plane>(0.5, 32);
 }

@@ -1,20 +1,30 @@
 //! The universal currency for stored-format geometry.
 //!
-//! A GeometrySet holds all members of a document's geometry in stored format: polygon rings closed
-//! per RFC 7946 (first == last), flattened into a single vertex array per member, edge_id gaps at
-//! ring boundaries. After smashing, the ring structure is gone. Edge access is always
-//! vertices[edge_idx] and vertices[edge_idx + 1]. One Geometry in, one GeometrySet out.
+//! A GeometrySet holds one input value. Polygon rings remain closed, with offsets
+//! into a flat vertex array and gaps in the edge indices at ring boundaries.
 
 use super::geometry::Geometry;
 use super::surface::Surface;
 
-/// One smashed geometry's edges. After smashing, the type distinctions (point, line string,
-/// polygon) are gone. Everything is consecutive vertex pairs and a closed flag.
+/// The declared type of one geometry member.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GeometryKind {
+    /// One point.
+    Point,
+    /// An ordered line chain, including a collapsed or empty chain.
+    LineString,
+    /// A shell followed by its hole rings.
+    Polygon,
+}
+
+/// One member's source vertices, chain boundaries and declared type.
 #[derive(Clone)]
 pub struct EdgeSet<S: Surface> {
+    /// The source type, retained even when the member is effectively empty.
+    pub kind: GeometryKind,
     /// Flattened vertex array. Edges are consecutive pairs: vertices[i] to vertices[i+1].
     pub vertices: Vec<S::Point>,
-    /// Whether this geometry has interior (polygon).
+    /// Whether this member is a polygon. Its effective material may still be empty.
     pub closed: bool,
     /// Whether the Hilbert curve start point is inside this geometry's interior.
     pub contains_hilbert_start: bool,
@@ -22,19 +32,43 @@ pub struct EdgeSet<S: Surface> {
     pub ring_offsets: Vec<usize>,
 }
 
-/// Smashed geometry set for one field of one document. The geometry_id is assigned by the
+pub(crate) fn ring_material<S: Surface>(inside: &[bool]) -> bool {
+    if S::RING_ROLES {
+        inside.first().copied().unwrap_or(false) && !inside[1..].iter().any(|&v| v)
+    } else {
+        inside.iter().fold(false, |parity, &value| parity ^ value)
+    }
+}
+
+impl<S: Surface> EdgeSet<S> {
+    pub(crate) fn ring_states(&self, point: &S::Point) -> Vec<bool> {
+        self.ring_offsets
+            .windows(2)
+            .map(|range| {
+                let ring = &self.vertices[range[0]..range[1]];
+                S::contains_point(point, ring, S::origin_inside(ring))
+            })
+            .collect()
+    }
+
+    pub(crate) fn contains_point(&self, point: &S::Point) -> bool {
+        self.closed && ring_material::<S>(&self.ring_states(point))
+    }
+}
+
+/// Smashed geometry set for one input field value. The geometry_id is assigned by the
 /// builder or writer that receives the set, not carried here.
 #[derive(Clone)]
 pub struct GeometrySet<S: Surface> {
-    /// The smashed members of this document's geometry field.
+    /// The smashed members of this input value.
     pub members: Vec<EdgeSet<S>>,
     /// The document this set belongs to.
     pub doc_id: u32,
 }
 
-/// Smash a projected geometry into a GeometrySet in stored format. Reverses CW hole rings per
-/// RFC 7946, computes contains_hilbert_start, and flattens rings into a single vertex array per
-/// member. One Geometry in, one GeometrySet out.
+/// Smash a projected geometry into stored format. Applies the surface's ring normalization,
+/// computes contains_hilbert_start, and flattens rings into one vertex array per member.
+/// One Geometry in, one GeometrySet out.
 pub fn to_geometry_set<S: Surface>(geometry: &Geometry<S>, doc_id: u32) -> GeometrySet<S> {
     let mut members = Vec::new();
     smash(&mut members, geometry);
@@ -45,6 +79,7 @@ fn smash<S: Surface>(members: &mut Vec<EdgeSet<S>>, geometry: &Geometry<S>) {
     match geometry {
         Geometry::Point(v) => {
             members.push(EdgeSet {
+                kind: GeometryKind::Point,
                 vertices: vec![*v],
                 closed: false,
                 contains_hilbert_start: false,
@@ -54,6 +89,7 @@ fn smash<S: Surface>(members: &mut Vec<EdgeSet<S>>, geometry: &Geometry<S>) {
         Geometry::MultiPoint(points) => {
             for v in points {
                 members.push(EdgeSet {
+                    kind: GeometryKind::Point,
                     vertices: vec![*v],
                     closed: false,
                     contains_hilbert_start: false,
@@ -64,6 +100,7 @@ fn smash<S: Surface>(members: &mut Vec<EdgeSet<S>>, geometry: &Geometry<S>) {
         Geometry::LineString(line) => {
             let n = line.len();
             members.push(EdgeSet {
+                kind: GeometryKind::LineString,
                 vertices: line.clone(),
                 closed: false,
                 contains_hilbert_start: false,
@@ -74,6 +111,7 @@ fn smash<S: Surface>(members: &mut Vec<EdgeSet<S>>, geometry: &Geometry<S>) {
             for line in lines {
                 let n = line.len();
                 members.push(EdgeSet {
+                    kind: GeometryKind::LineString,
                     vertices: line.clone(),
                     closed: false,
                     contains_hilbert_start: false,
@@ -84,6 +122,7 @@ fn smash<S: Surface>(members: &mut Vec<EdgeSet<S>>, geometry: &Geometry<S>) {
         Geometry::Polygon(polygon) => {
             let (vertices, hilbert_inside, offsets) = smash_polygon::<S>(polygon);
             members.push(EdgeSet {
+                kind: GeometryKind::Polygon,
                 vertices,
                 closed: true,
                 contains_hilbert_start: hilbert_inside,
@@ -94,6 +133,7 @@ fn smash<S: Surface>(members: &mut Vec<EdgeSet<S>>, geometry: &Geometry<S>) {
             for polygon in multi_polygon {
                 let (vertices, hilbert_inside, offsets) = smash_polygon::<S>(polygon);
                 members.push(EdgeSet {
+                    kind: GeometryKind::Polygon,
                     vertices,
                     closed: true,
                     contains_hilbert_start: hilbert_inside,
@@ -117,21 +157,19 @@ fn smash<S: Surface>(members: &mut Vec<EdgeSet<S>>, geometry: &Geometry<S>) {
 /// Ring offsets always start with 0 and end with the total vertex count.
 fn smash_polygon<S: Surface>(rings: &[Vec<S::Point>]) -> (Vec<S::Point>, bool, Vec<usize>) {
     let mut flat = Vec::new();
-    let mut hilbert_inside = false;
+    let mut ring_inside = Vec::new();
     let mut offsets = vec![0usize];
     let hilbert_start = S::hilbert_start();
 
     for ring in rings {
         let mut ring = ring.clone();
         S::normalize_ring(&mut ring);
-        assert!(ring.len() >= 4 && ring.first() == ring.last());
+        assert!(ring.is_empty() || (ring.len() >= 4 && ring.first() == ring.last()));
         let origin_inside = S::origin_inside(&ring);
-        if S::contains_point(&hilbert_start, &ring, origin_inside) {
-            hilbert_inside = !hilbert_inside;
-        }
+        ring_inside.push(S::contains_point(&hilbert_start, &ring, origin_inside));
         flat.extend_from_slice(&ring);
         offsets.push(flat.len());
     }
 
-    (flat, hilbert_inside, offsets)
+    (flat, ring_material::<S>(&ring_inside), offsets)
 }

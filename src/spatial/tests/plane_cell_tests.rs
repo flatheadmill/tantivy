@@ -9,13 +9,12 @@ use crate::spatial::clipped_shape::ClippedShape;
 use crate::spatial::plane::Plane;
 use crate::spatial::s2cell_id::S2CellId;
 use crate::spatial::s2coords::LIMIT_IJ;
-use crate::spatial::s2padded_cell::S2PaddedCell;
 use crate::spatial::shape_index::{ShapeCell, ShapeIndex};
 use crate::spatial::surface::Surface;
 
-fn grid_index(u: f64) -> i32 {
-    let scaled =
-        (BigRational::from_float(u).unwrap() + BigInt::from(1)) * BigInt::from(LIMIT_IJ / 2);
+fn grid_index(u: f64, scale: i32) -> i32 {
+    let scaled = (BigRational::from_float(u).unwrap() / BigInt::from(scale) + BigInt::from(1))
+        * BigInt::from(LIMIT_IJ / 2);
     scaled
         .to_integer()
         .to_i64()
@@ -29,7 +28,7 @@ fn check_point(point: [f64; 2]) {
     let (face, i, j, _) = id.to_face_ij_orientation();
     assert_eq!(
         (face, i, j),
-        (0, grid_index(point[0]), grid_index(point[1])),
+        (0, grid_index(point[0], 180), grid_index(point[1], 90)),
         "{point:?}"
     );
 }
@@ -48,9 +47,13 @@ fn test_cell_id_from_point_boundaries() {
     indices.dedup();
     for i in indices {
         let boundary = (i as f64) / ((LIMIT_IJ / 2) as f64) - 1.0;
-        for u in [boundary.next_down(), boundary, boundary.next_up()] {
-            check_point([u, -0.3]);
-            check_point([-0.3, u]);
+        for (axis, scale) in [(0, 180.0), (1, 90.0)] {
+            let divider = boundary * scale;
+            for coordinate in [divider.next_down(), divider, divider.next_up()] {
+                let mut point = [-0.3, -0.3];
+                point[axis] = coordinate;
+                check_point(point);
+            }
         }
     }
     for exponent in [1, 29, 30, 52, 53, 54, 55, 100, 600, 1022, 1074] {
@@ -61,9 +64,9 @@ fn test_cell_id_from_point_boundaries() {
     for point in [
         [0.0, -0.0],
         [-0.0, 0.0],
-        [-1.0, 1.0],
-        [1.0, -1.0],
-        [-2.0, 2.0],
+        [-180.0, 90.0],
+        [180.0, -90.0],
+        [-200.0, 100.0],
     ] {
         check_point(point);
     }
@@ -92,12 +95,12 @@ fn lookup_points(index: &ShapeIndex) -> Vec<[f64; 2]> {
     let mut points = vec![[-2.0f64.powi(-54), -2.0f64.powi(-54)], [0.0, -0.0]];
     for cell in &index.cells {
         points.push(Plane::cell_center(cell.cell_id));
-        let bound = S2PaddedCell::<Plane>::new(cell.cell_id, 0.0).bound();
+        let bound = crate::spatial::plane_support_tests::nominal_bound(cell.cell_id);
         for k in 0..4 {
             let [u, v] = bound.get_vertex(k);
             for u in [u.next_down(), u, u.next_up()] {
                 for v in [v.next_down(), v, v.next_up()] {
-                    if (-1.0..=1.0).contains(&u) && (-1.0..=1.0).contains(&v) {
+                    if (-180.0..=180.0).contains(&u) && (-90.0..=90.0).contains(&v) {
                         points.push([u, v]);
                     }
                 }
@@ -112,11 +115,12 @@ fn containing_cell(index: &ShapeIndex, point: [f64; 2]) -> &ShapeCell {
         .cells
         .iter()
         .find(|cell| {
-            let bound = S2PaddedCell::<Plane>::new(cell.cell_id, 0.0).bound();
+            let bound = crate::spatial::plane_support_tests::nominal_bound(cell.cell_id);
             (0..2).all(|axis| {
                 point[axis] >= bound[axis].lo()
                     && (point[axis] < bound[axis].hi()
-                        || (point[axis] == 1.0 && bound[axis].hi() == 1.0))
+                        || (point[axis] == [180.0, 90.0][axis]
+                            && bound[axis].hi() == [180.0, 90.0][axis]))
             })
         })
         .unwrap()
@@ -155,7 +159,12 @@ proptest! {
     #[test]
     fn test_cell_id_from_point_rational_grid(bits in any::<[u64; 2]>()) {
         let point = bits.map(f64::from_bits);
-        prop_assume!(point.iter().all(|u| u.is_finite() && u.abs() <= 1.0));
+        prop_assume!(
+            point[0].is_finite()
+                && point[0].abs() <= 180.0
+                && point[1].is_finite()
+                && point[1].abs() <= 90.0
+        );
         check_point(point);
     }
 }

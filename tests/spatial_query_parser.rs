@@ -753,10 +753,6 @@ fn test_parser_rejects_unsupported_spatial_forms() -> tantivy::Result<()> {
     let parks = ["p_band", "p_far", "p_hit", "p_ok", "p_small"];
     for (spatial, message) in [
         (
-            "$contains($query(unknown:trail))",
-            "$contains joins are not supported.",
-        ),
-        (
             "$between(1km, 2km, $query(unknown:trail))",
             "$between is not supported.",
         ),

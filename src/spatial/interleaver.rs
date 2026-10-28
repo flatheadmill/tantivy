@@ -439,6 +439,7 @@ impl<'a, S: Surface> Iterator for Interleaver<'a, S> {
                             self.splits += 1;
                             for entry in coarse_split(
                                 merged,
+                                self.edge_cache,
                                 &mut self.crossings,
                                 &mut self.crossers,
                                 &self.segment_names,
@@ -452,17 +453,17 @@ impl<'a, S: Surface> Iterator for Interleaver<'a, S> {
                 } else {
                     self.cells_emitted += 1;
                     self.heap.push(entry);
-                    return flatten(sponge);
+                    return flatten(sponge, self.edge_cache);
                 }
             } else {
                 self.cells_emitted += 1;
-                return flatten(sponge);
+                return flatten(sponge, self.edge_cache);
             }
         }
     }
 }
 
-fn flatten<S: Surface>(sponge: HeapEntry<S>) -> Option<ShapeCell> {
+fn flatten<S: Surface>(sponge: HeapEntry<S>, edge_cache: &EdgeCache<'_, S>) -> Option<ShapeCell> {
     let mut merged = match sponge {
         HeapEntry::Source { cell, .. } => return Some(cell),
         HeapEntry::Sponge(merged) => merged,
@@ -490,7 +491,7 @@ fn flatten<S: Surface>(sponge: HeapEntry<S>) -> Option<ShapeCell> {
 
         // Collect edges matching our geometry_id.
         if edge_index < merged.edges.len() && merged.edges[edge_index].geometry_id == geometry_id {
-            let mut crosser = if anchor.closed {
+            let mut crosser = if anchor.closed && !S::RING_ROLES {
                 Some(S::EdgeCrosser::new(&anchor.center, &sponge_center))
             } else {
                 None
@@ -507,6 +508,13 @@ fn flatten<S: Surface>(sponge: HeapEntry<S>) -> Option<ShapeCell> {
                 }
                 edge_index += 1;
             }
+        }
+
+        if S::RING_ROLES && anchor.closed && !edge_indices.is_empty() {
+            contains_center = edge_cache
+                .get(geometry_id)
+                .edge_set()
+                .contains_point(&sponge_center);
         }
 
         assert!(
@@ -754,6 +762,7 @@ fn clip_v_bound<S: Surface>(
 
 fn coarse_split<S: Surface>(
     mut merged: SpongeCell<S>,
+    edge_cache: &EdgeCache<'_, S>,
     crossings: &mut u64,
     crossers: &mut u64,
     segment_names: &[String],
@@ -954,7 +963,7 @@ fn coarse_split<S: Surface>(
                     == anchor.geometry_id
             {
                 *crossers += 1;
-                let mut crosser = if anchor.closed {
+                let mut crosser = if anchor.closed && !S::RING_ROLES {
                     Some(S::EdgeCrosser::new(&parent_center, &child_center))
                 } else {
                     None
@@ -1005,6 +1014,12 @@ fn coarse_split<S: Surface>(
                     }
                     sponge_edge_index += 1;
                 }
+            }
+            if S::RING_ROLES && anchor.closed && !edge_indices.is_empty() {
+                contains_center = edge_cache
+                    .get(anchor.geometry_id)
+                    .edge_set()
+                    .contains_point(&child_center);
             }
             assert!(
                 anchor.closed || !contains_center,

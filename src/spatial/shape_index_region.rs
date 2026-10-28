@@ -43,6 +43,8 @@ pub trait ContainmentIndex<S: Surface> {
     fn find_clipped(&mut self, geometry_id: GeometryId, point: &S::Point) -> Option<ClippedInfo>;
     /// Resolves an edge index to its two endpoint vertices.
     fn resolve_edge(&mut self, geometry_id: GeometryId, edge_index: u32) -> (S::Point, S::Point);
+    /// Locate a point against the complete polygon member.
+    fn contains_polygon_point(&mut self, geometry_id: GeometryId, point: &S::Point) -> bool;
 }
 
 /// Indexed point-in-polygon through either backend. Finds the cell containing the test point,
@@ -58,6 +60,9 @@ pub fn contains_point<S: Surface, T: ContainmentIndex<S>>(
     };
     let mut inside = info.contains_center;
     if !info.edge_indices.is_empty() {
+        if S::RING_ROLES {
+            return index.contains_polygon_point(geometry_id, point);
+        }
         let center = S::cell_center(info.cell_id);
         let mut crosser = S::EdgeCrosser::new(&center, point);
         for &edge_index in &info.edge_indices {
@@ -105,6 +110,10 @@ impl<S: Surface, E: EdgeProvider<Point = S::Point>> ContainmentIndex<S>
     fn resolve_edge(&mut self, geometry_id: GeometryId, edge_index: u32) -> (S::Point, S::Point) {
         self.edges.get_edge(geometry_id, edge_index)
     }
+
+    fn contains_polygon_point(&mut self, geometry_id: GeometryId, point: &S::Point) -> bool {
+        self.edges.contains_polygon_point(geometry_id, point)
+    }
 }
 
 /// Segment containment index wrapping a CellIndexReader and an EdgeCache.
@@ -135,6 +144,13 @@ impl<S: Surface> ContainmentIndex<S> for SegmentIndex<'_, '_, S> {
         let vertices = entry.vertices();
         let i = edge_index as usize;
         (vertices[i], vertices[i + 1])
+    }
+
+    fn contains_polygon_point(&mut self, geometry_id: GeometryId, point: &S::Point) -> bool {
+        self.edge_cache
+            .get(geometry_id)
+            .edge_set()
+            .contains_point(point)
     }
 }
 
@@ -211,6 +227,9 @@ fn clipped_shape_contains_point<S: Surface, E: EdgeProvider<Point = S::Point>>(
 ) -> bool {
     let mut inside = clipped.contains_center;
     if !clipped.edge_indices.is_empty() {
+        if S::RING_ROLES {
+            return edges.contains_polygon_point(clipped.geometry_id, point);
+        }
         let cell_center = S::cell_center(cell_id);
         let mut crosser = S::EdgeCrosser::new(&cell_center, point);
         for &edge_index in &clipped.edge_indices {

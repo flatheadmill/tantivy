@@ -1,4 +1,4 @@
-//! Within query: find indexed geometries entirely inside the query polygon.
+//! Covered-by query: find indexed geometries covered by the query.
 
 use std::collections::BinaryHeap;
 
@@ -10,6 +10,8 @@ use super::edge_cache::EdgeCache;
 use super::edge_crosser::EdgeCrosser;
 use super::edge_provider::EdgeProvider;
 use super::geometry_set::GeometrySet;
+use super::plane::query::PlaneQuery;
+use super::plane::Predicate;
 use super::query_edge_provider::QueryEdgeProvider;
 use super::region_coverer::CovererOptions;
 use super::s2cell_id::S2CellId;
@@ -26,15 +28,22 @@ struct QueryPolygon<S: Surface> {
     edges: QueryEdgeProvider<S>,
 }
 
-/// Prepared within query. For a single polygon query, there is one QueryPolygon. For a
-/// multi-polygon, there is one per member, sorted by vertex count descending.
+/// Prepared covered-by query. Plane evaluates the complete query value. Sphere keeps
+/// one QueryPolygon per member, sorted by vertex count descending.
 pub struct Within<S: Surface> {
+    plane: Option<PlaneQuery>,
     polygons: Vec<QueryPolygon<S>>,
 }
 
 impl<S: Surface> Within<S> {
     /// Build the query from a smashed GeometrySet.
     pub fn new(set: GeometrySet<S>, _options: CovererOptions) -> Self {
+        if let Some(plane) = PlaneQuery::prepare(&set) {
+            return Self {
+                plane: Some(plane),
+                polygons: Vec::new(),
+            };
+        }
         let mut members: Vec<_> = set.members.into_iter().enumerate().collect();
         members.sort_by(|a, b| b.1.vertices.len().cmp(&a.1.vertices.len()));
 
@@ -50,7 +59,10 @@ impl<S: Surface> Within<S> {
             polygons.push(QueryPolygon { index, edges });
         }
 
-        Self { polygons }
+        Self {
+            plane: None,
+            polygons,
+        }
     }
 
     /// Search one segment for geometries entirely within the query polygon.
@@ -61,6 +73,16 @@ impl<S: Surface> Within<S> {
         edge_cache: &mut EdgeCache<'a, S>,
         max_doc: u32,
     ) -> BitSet {
+        if let Some(plane) = &self.plane {
+            return plane.search(
+                reader,
+                terms_filter,
+                edge_cache,
+                max_doc,
+                Predicate::CoveredBy,
+                false,
+            );
+        }
         let geometry_count = edge_cache.geometry_count(0);
         let included: Vec<BitSet> = (0..self.polygons.len())
             .map(|_| BitSet::with_max_value(geometry_count))
@@ -243,7 +265,9 @@ impl<'a, 'b, S: Surface> WithinSearch<'a, 'b, S> {
                 };
                 let parent_center = entry.pcell.get_center();
                 let mut children = covering_split(&entry, &get_edge, &start_for_cell);
-                covering_contains_center::<S>(&parent_center, &mut children, &get_edge);
+                covering_contains_center::<S>(&parent_center, &mut children, &get_edge, &|point| {
+                    polygon.edges.get_edge_set((0, 0)).contains_point(point)
+                });
                 for child in children {
                     heap.push(child);
                 }

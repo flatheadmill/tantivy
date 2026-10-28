@@ -40,16 +40,26 @@ pub trait Surface {
     /// Construct a point from DIMENSIONS * 8 little-endian bytes.
     fn point_from_le_bytes(bytes: &[u8]) -> Self::Point;
 
-    /// Euclidean distance between two points on this surface.
+    /// Edge length in the units used for cell subdivision.
     fn edge_length(a: &Self::Point, b: &Self::Point) -> f64;
 
     /// Cell padding for edge clipping. Compensates for face clipping error on the
-    /// sphere. Zero on the plane where clip_to_face is exact.
+    /// sphere. Zero on Plane, where source edges certify nominal cell support.
     const CELL_PADDING: f64;
 
-    /// Edges are straight in face UV, and surface coordinates equal UV coordinates
-    /// without projection or clipping error. Endpoint boxes enclose the complete edge.
+    /// Source edges have exact contact tests against nominal face rectangles.
+    /// UV bounds are conservative navigation bounds, not the stored geometry.
     const EXACT_SUPPORT: bool = false;
+
+    /// Polygon rings represent a shell followed by holes, rather than one parity sum.
+    const RING_ROLES: bool = false;
+
+    /// A conservative face UV box for an uncut edge.
+    fn edge_bound_uv(v0: &Self::Point, v1: &Self::Point, face: i32) -> R2Rect {
+        let (a_u, a_v) = Self::point_to_face_uv(face, v0);
+        let (b_u, b_v) = Self::point_to_face_uv(face, v1);
+        R2Rect::from_point_pair([a_u, a_v], [b_u, b_v])
+    }
 
     /// Whether an original edge meets a closed nominal rectangle on this face.
     /// Called only when EXACT_SUPPORT is true.
@@ -131,9 +141,7 @@ pub(crate) fn exact_edge_bound<S: Surface>(
     if !S::edge_intersects_rect(v0, v1, face, bound) {
         return None;
     }
-    let (a_u, a_v) = S::point_to_face_uv(face, v0);
-    let (b_u, b_v) = S::point_to_face_uv(face, v1);
-    Some(R2Rect::from_point_pair([a_u, a_v], [b_u, b_v]).intersection(bound))
+    Some(S::edge_bound_uv(v0, v1, face).intersection(bound))
 }
 
 /// Returns the center of a cell using the same ij midpoint computation as S2PaddedCell.

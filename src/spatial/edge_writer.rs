@@ -10,7 +10,7 @@ use std::marker::PhantomData;
 use common::CountingWriter;
 
 use crate::directory::WritePtr;
-use crate::spatial::geometry_set::GeometrySet;
+use crate::spatial::geometry_set::{GeometryKind, GeometrySet};
 use crate::spatial::surface::Surface;
 
 /// Streams geometry entries to disk. The Surface type parameter determines how many f64
@@ -58,7 +58,12 @@ impl<'a, S: Surface> EdgeWriter<'a, S> {
                     0
                 })
                 | (if has_holes { 0x04 } else { 0 })
-                | (if is_head { 0x08 } else { 0 });
+                | (if is_head { 0x08 } else { 0 })
+                | (if member.kind == GeometryKind::LineString {
+                    0x10
+                } else {
+                    0
+                });
 
             let ring_boundary_bytes = if has_holes {
                 (member.ring_offsets.len() - 2) * 4

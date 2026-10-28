@@ -8,4 +8,6 @@ pub trait EdgeProvider {
     type Point: Copy;
     /// Returns the two endpoints of the given edge.
     fn get_edge(&self, geometry_id: GeometryId, edge_index: u32) -> (Self::Point, Self::Point);
+    /// Locate a point against the complete polygon member, including ring roles.
+    fn contains_polygon_point(&self, geometry_id: GeometryId, point: &Self::Point) -> bool;
 }

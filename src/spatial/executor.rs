@@ -13,18 +13,14 @@ use std::fmt;
 use common::BitSet;
 
 use super::cell_index_reader::CellIndexReader;
-use super::distance::Distance;
-use super::edge_cache::EdgeCache;
-use super::edge_reader::EdgeReader;
-use super::geometry_set::GeometrySet;
-use super::intersects::Intersects;
-use super::region_coverer::CovererOptions;
-use super::sphere::Sphere;
+use super::geometry::Geometry;
+use super::plane::Plane;
+use super::spatial_index_manager::{PreparedSpatialQuery, SpatialIndex};
 use crate::core::Searcher;
 use crate::docset::{DocSet, TERMINATED};
 use crate::index::SegmentId;
 use crate::query::{BitSetDocSet, EnableScoring, Explanation, Query, Scorer, Weight};
-use crate::schema::Field;
+use crate::schema::{Field, FieldType};
 use crate::{DocId, Score, SegmentReader};
 
 /// Spatial relationship for a join predicate.
@@ -36,8 +32,12 @@ pub enum SpatialRelation {
     Between(f64, f64),
     /// Geometries intersect.
     Intersects,
-    /// One geometry contains the other.
+    /// The outer value contains the inner value, with a common interior.
     Contains,
+    /// The outer value covers the inner value, including its boundary.
+    Covers,
+    /// The outer value is covered by the inner value.
+    CoveredBy,
 }
 
 /// A node in the execution plan tree.
@@ -50,7 +50,7 @@ pub enum PlanNode {
         /// The spatial field.
         field: Field,
         /// The query geometry.
-        geometry: GeometrySet<Sphere>,
+        geometry: Geometry<Plane>,
         /// Number of nearest neighbors.
         k: usize,
         /// If present, only documents passing this node are considered.
@@ -61,8 +61,8 @@ pub enum PlanNode {
     Intersects {
         /// The spatial field.
         field: Field,
-        /// The query geometry (smashed).
-        geometry: GeometrySet<Sphere>,
+        /// The query geometry in source longitude and latitude.
+        geometry: Geometry<Plane>,
         /// Documents passing this node are eligible candidates.
         filter: Box<PlanNode>,
     },
@@ -71,8 +71,8 @@ pub enum PlanNode {
     Within {
         /// The spatial field.
         field: Field,
-        /// The query geometry (smashed).
-        geometry: GeometrySet<Sphere>,
+        /// The query geometry in source longitude and latitude.
+        geometry: Geometry<Plane>,
         /// Maximum distance in radians.
         radius: f64,
         /// Documents passing this node are eligible candidates.
@@ -157,34 +157,10 @@ fn evaluate(
             geometry,
             filter,
         } => {
-            // Evaluate the filter node -> per-segment bitsets.
             let filter_output = evaluate(filter, searcher, segments)?;
-
-            // Build the Intersects once from the smashed geometry.
-            let intersects = Intersects::new(geometry.clone(), CovererOptions::default());
-
-            // For each segment, run the filtered spatial traversal.
-            let mut results = HashMap::new();
-            for reader in segments {
-                let spatial = reader.spatial_fields().get_field(*field)?;
-                if let Some(spatial_reader) = spatial {
-                    let cell_reader = CellIndexReader::open(spatial_reader.cells_bytes())?;
-                    let er = EdgeReader::<Sphere>::open(spatial_reader.edges_bytes());
-                    let mut edge_cache = EdgeCache::new(vec![er], 100_000);
-
-                    let filter_bitset =
-                        filter_output.bitset_for(&reader.segment_id(), reader.max_doc());
-
-                    let bitset = intersects.search(
-                        &cell_reader,
-                        Some(&filter_bitset),
-                        &mut edge_cache,
-                        reader.max_doc(),
-                    );
-                    results.insert(reader.segment_id(), SegmentResult::Match(bitset));
-                }
-            }
-            Ok(StageOutput { results })
+            let implementation = field_index(searcher, *field)?;
+            let query = implementation.prepare_intersects(geometry);
+            search_prepared(*field, query.as_ref(), &filter_output, segments)
         }
 
         PlanNode::Within {
@@ -194,31 +170,9 @@ fn evaluate(
             filter,
         } => {
             let filter_output = evaluate(filter, searcher, segments)?;
-
-            let query =
-                Distance::<Sphere>::new(geometry.clone(), *radius, CovererOptions::default());
-
-            let mut results = HashMap::new();
-            for reader in segments {
-                let spatial = reader.spatial_fields().get_field(*field)?;
-                if let Some(spatial_reader) = spatial {
-                    let cell_reader = CellIndexReader::open(spatial_reader.cells_bytes())?;
-                    let er = EdgeReader::<Sphere>::open(spatial_reader.edges_bytes());
-                    let mut edge_cache = EdgeCache::new(vec![er], 100_000);
-
-                    let filter_bitset =
-                        filter_output.bitset_for(&reader.segment_id(), reader.max_doc());
-
-                    let bitset = query.search(
-                        &cell_reader,
-                        Some(&filter_bitset),
-                        &mut edge_cache,
-                        reader.max_doc(),
-                    );
-                    results.insert(reader.segment_id(), SegmentResult::Match(bitset));
-                }
-            }
-            Ok(StageOutput { results })
+            let implementation = field_index(searcher, *field)?;
+            let query = implementation.prepare_distance(geometry, *radius)?;
+            search_prepared(*field, query.as_ref(), &filter_output, segments)
         }
 
         PlanNode::Knn { .. } => {
@@ -231,114 +185,105 @@ fn evaluate(
             inner,
             relation,
         } => {
-            // Collect inner bitsets across all segments.
+            let implementation = field_index(searcher, *field)?;
+            implementation.validate_join(relation)?;
             let inner_output = evaluate(inner, searcher, segments)?;
-
-            // Collect outer bitsets across all segments.
             let outer_output = evaluate(outer, searcher, segments)?;
-
-            // For each segment, walk its cell index for outer geometries, probe all segments for
-            // inner matches.
             let mut results = HashMap::new();
-            for reader in segments.iter() {
+            for reader in segments {
                 let outer_bitset = outer_output.bitset_for(&reader.segment_id(), reader.max_doc());
                 let mut result_bitset = BitSet::with_max_value(reader.max_doc());
                 let mut visited = std::collections::HashSet::new();
-
-                let spatial = reader.spatial_fields().get_field(*field)?;
-                if spatial.is_none() {
-                    results.insert(reader.segment_id(), SegmentResult::Match(result_bitset));
-                    continue;
-                }
-                let spatial_reader = spatial.unwrap();
-                let cell_reader = CellIndexReader::open(spatial_reader.cells_bytes())?;
-                let er = EdgeReader::<Sphere>::open(spatial_reader.edges_bytes());
-                let edge_cache = EdgeCache::new(vec![er], 100_000);
-
-                for cell in cell_reader.iter() {
-                    for clipped in &cell.shapes {
-                        let geometry_id = clipped.geometry_id;
-                        if !visited.insert(geometry_id) {
-                            continue;
-                        }
-                        let doc_id = edge_cache.doc_id_for(geometry_id);
-                        if !outer_bitset.contains(doc_id) {
-                            continue;
-                        }
-
-                        // Read the outer geometry.
-                        let outer_geometry = edge_cache.get(geometry_id).geometry_set().clone();
-
-                        // Probe all segments for inner matches.
-                        let mut found = false;
-                        for probe_reader in segments.iter() {
-                            let probe_spatial = probe_reader.spatial_fields().get_field(*field)?;
-                            if let Some(probe_spatial_reader) = probe_spatial {
-                                let probe_cell_reader =
-                                    CellIndexReader::open(probe_spatial_reader.cells_bytes())?;
-                                let probe_er =
-                                    EdgeReader::<Sphere>::open(probe_spatial_reader.edges_bytes());
-                                let mut probe_edge_cache = EdgeCache::new(vec![probe_er], 100_000);
-                                let inner_bitset = inner_output
-                                    .bitset_for(&probe_reader.segment_id(), probe_reader.max_doc());
-
-                                found = match relation {
-                                    SpatialRelation::Near(r) => {
-                                        let probe = Distance::<Sphere>::any_within(
-                                            outer_geometry.clone(),
-                                            *r,
-                                            CovererOptions::default(),
-                                        );
-                                        probe
-                                            .search(
-                                                &probe_cell_reader,
-                                                Some(&inner_bitset),
-                                                &mut probe_edge_cache,
-                                                probe_reader.max_doc(),
-                                            )
-                                            .len()
-                                            > 0
+                if let Some(spatial) = reader.spatial_fields().get_field(*field)? {
+                    let cells = CellIndexReader::open(spatial.cells_bytes())?;
+                    for cell in cells.iter() {
+                        for shape in &cell.shapes {
+                            let (head, doc_id) = implementation
+                                .value_id(spatial.edges_bytes(), shape.geometry_id.1)?;
+                            if !outer_bitset.contains(doc_id)
+                                || result_bitset.contains(doc_id)
+                                || !visited.insert(head)
+                            {
+                                continue;
+                            }
+                            let query = implementation.prepare_join_query(
+                                spatial.edges_bytes(),
+                                head,
+                                relation,
+                            )?;
+                            for probe_reader in segments {
+                                if let Some(probe) =
+                                    probe_reader.spatial_fields().get_field(*field)?
+                                {
+                                    let filter = inner_output.bitset_for(
+                                        &probe_reader.segment_id(),
+                                        probe_reader.max_doc(),
+                                    );
+                                    let hits = query.search_segment_filtered(
+                                        probe.cells_bytes(),
+                                        probe.edges_bytes(),
+                                        probe.doc_ids_bytes(),
+                                        probe_reader.max_doc(),
+                                        &filter,
+                                    )?;
+                                    if hits.len() > 0 {
+                                        result_bitset.insert(doc_id);
+                                        break;
                                     }
-                                    SpatialRelation::Intersects => {
-                                        let probe = Intersects::new(
-                                            outer_geometry.clone(),
-                                            CovererOptions::default(),
-                                        );
-                                        probe
-                                            .search(
-                                                &probe_cell_reader,
-                                                Some(&inner_bitset),
-                                                &mut probe_edge_cache,
-                                                probe_reader.max_doc(),
-                                            )
-                                            .len()
-                                            > 0
-                                    }
-                                    SpatialRelation::Contains => {
-                                        todo!("contains join probe")
-                                    }
-                                    SpatialRelation::Between(_, _) => {
-                                        todo!("between is composed from distance queries")
-                                    }
-                                };
-                                if found {
-                                    break;
                                 }
                             }
                         }
-
-                        if found {
-                            result_bitset.insert(doc_id);
-                        }
                     }
                 }
-
                 results.insert(reader.segment_id(), SegmentResult::Match(result_bitset));
             }
-
             Ok(StageOutput { results })
         }
     }
+}
+
+fn field_index(searcher: &Searcher, field: Field) -> crate::Result<Box<dyn SpatialIndex>> {
+    let schema = searcher.index().schema();
+    let FieldType::Spatial(options) = schema.get_field_entry(field).field_type() else {
+        return Err(crate::TantivyError::InvalidArgument(
+            "field is not spatial".into(),
+        ));
+    };
+    searcher
+        .index()
+        .spatial_indices()
+        .get(options.spatial_index_name())
+        .ok_or_else(|| {
+            crate::TantivyError::InvalidArgument(format!(
+                "spatial index '{}' not registered",
+                options.spatial_index_name()
+            ))
+        })
+}
+
+fn search_prepared(
+    field: Field,
+    query: &dyn PreparedSpatialQuery,
+    filters: &StageOutput,
+    segments: &[SegmentReader],
+) -> crate::Result<StageOutput> {
+    let mut results = HashMap::new();
+    for reader in segments {
+        let hits = if let Some(spatial) = reader.spatial_fields().get_field(field)? {
+            let filter = filters.bitset_for(&reader.segment_id(), reader.max_doc());
+            query.search_segment_filtered(
+                spatial.cells_bytes(),
+                spatial.edges_bytes(),
+                spatial.doc_ids_bytes(),
+                reader.max_doc(),
+                &filter,
+            )?
+        } else {
+            BitSet::with_max_value(reader.max_doc())
+        };
+        results.insert(reader.segment_id(), SegmentResult::Match(hits));
+    }
+    Ok(StageOutput { results })
 }
 
 /// Query that evaluates a spatial execution plan during Weight construction.

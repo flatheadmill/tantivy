@@ -5,7 +5,7 @@
 use super::clip_options::ClipOptions;
 use super::clipped_shape::ClippedShape;
 use super::edge_crosser::EdgeCrosser;
-use super::geometry_set::GeometrySet;
+use super::geometry_set::{ring_material, GeometrySet};
 use super::r1interval::R1Interval;
 use super::r2rect::R2Rect;
 use super::s2cell_id::S2CellId;
@@ -124,6 +124,8 @@ struct InteriorTracker<S: Surface> {
     crosser: S::EdgeCrosser,
     /// Shapes whose interiors contain the current focus point.
     shape_ids: Vec<u32>,
+    ring_states: Vec<Vec<bool>>,
+    ring_offsets: Vec<Vec<usize>>,
     /// The next cell ID we expect to process.
     next_cellid: S2CellId,
 }
@@ -135,6 +137,8 @@ impl<S: Surface> InteriorTracker<S> {
             focus: origin,
             crosser: S::EdgeCrosser::new(&origin, &origin),
             shape_ids: Vec::new(),
+            ring_states: Vec::new(),
+            ring_offsets: Vec::new(),
             is_active: false,
             next_cellid: S2CellId::begin(S2CellId::MAX_LEVEL),
         }
@@ -151,9 +155,20 @@ impl<S: Surface> InteriorTracker<S> {
         }
     }
 
-    fn test_edge(&mut self, geometry_id: u32, v0: &S::Point, v1: &S::Point) {
+    fn test_edge(&mut self, geometry_id: u32, edge_index: u32, v0: &S::Point, v1: &S::Point) {
         if self.crosser.edge_or_vertex_crossing_two(v0, v1) {
-            self.toggle_shape(geometry_id);
+            if S::RING_ROLES {
+                let offsets = &self.ring_offsets[geometry_id as usize];
+                let ring = offsets.partition_point(|&offset| offset <= edge_index as usize) - 1;
+                let states = &mut self.ring_states[geometry_id as usize];
+                let before = ring_material::<S>(states);
+                states[ring] = !states[ring];
+                if before != ring_material::<S>(states) {
+                    self.toggle_shape(geometry_id);
+                }
+            } else {
+                self.toggle_shape(geometry_id);
+            }
         }
     }
 
@@ -234,6 +249,14 @@ impl<S: Surface> Clipper<S> {
         let mut gid: u32 = 0;
         for set in sets {
             for member in &set.members {
+                if S::RING_ROLES {
+                    self.tracker.ring_states.push(if member.closed {
+                        member.ring_states(&S::hilbert_start())
+                    } else {
+                        Vec::new()
+                    });
+                    self.tracker.ring_offsets.push(member.ring_offsets.clone());
+                }
                 if member.closed {
                     self.tracker.is_active = true;
                     if member.contains_hilbert_start {
@@ -396,7 +419,11 @@ impl<S: Surface> Clipper<S> {
         let mut bound = R2Rect::empty();
 
         for (i, fe) in face_edges.iter().enumerate() {
-            let edge_bound = R2Rect::from_point_pair(fe.a, fe.b);
+            let edge_bound = if S::EXACT_SUPPORT {
+                S::edge_bound_uv(&fe.v0, &fe.v1, face)
+            } else {
+                R2Rect::from_point_pair(fe.a, fe.b)
+            };
             clipped.push(ClippedEdge {
                 geometry_id: fe.geometry_id,
                 face_edge_index: i,
@@ -740,7 +767,8 @@ impl<S: Surface> Clipper<S> {
             for edge in edges {
                 let fe = &face_edges[edge.face_edge_index];
                 if fe.has_interior {
-                    self.tracker.test_edge(fe.geometry_id, &fe.v0, &fe.v1);
+                    self.tracker
+                        .test_edge(fe.geometry_id, fe.edge_index, &fe.v0, &fe.v1);
                 }
             }
         }
@@ -795,7 +823,8 @@ impl<S: Surface> Clipper<S> {
             for edge in edges {
                 let fe = &face_edges[edge.face_edge_index];
                 if fe.has_interior {
-                    self.tracker.test_edge(fe.geometry_id, &fe.v0, &fe.v1);
+                    self.tracker
+                        .test_edge(fe.geometry_id, fe.edge_index, &fe.v0, &fe.v1);
                 }
             }
             self.tracker.set_next_cellid(cell_id.next());
@@ -892,6 +921,7 @@ mod tests {
         ];
         let set = GeometrySet {
             members: vec![EdgeSet {
+                kind: crate::spatial::geometry_set::GeometryKind::Polygon,
                 vertices: ring,
                 closed: true,
                 contains_hilbert_start: true,

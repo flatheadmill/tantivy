@@ -155,6 +155,8 @@ mod tests {
         for text in [
             "$intersects($query(kind:trail))",
             "$contains($query(kind:trail))",
+            "$covers($query(kind:trail))",
+            "$coveredby($query(kind:trail))",
             "$within(1km, $query(kind:trail))",
             "$between(1km, 2km, $query(kind:trail))",
             "$within(1km, $query())",

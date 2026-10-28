@@ -23,11 +23,13 @@ use crate::spatial::distance::Distance;
 use crate::spatial::edge_cache::EdgeCache;
 use crate::spatial::edge_reader::EdgeReader;
 use crate::spatial::edge_writer::EdgeWriter;
+use crate::spatial::executor::SpatialRelation;
 use crate::spatial::geometry::Geometry;
 use crate::spatial::geometry_set::{to_geometry_set, GeometrySet};
 use crate::spatial::interleaver::Interleaver;
 use crate::spatial::intersects::Intersects;
-use crate::spatial::plane::Plane;
+use crate::spatial::plane::query::PlaneQuery;
+use crate::spatial::plane::{Plane, Predicate};
 use crate::spatial::region_coverer::CovererOptions;
 use crate::spatial::shape_index::write_cell_footer;
 use crate::spatial::sphere::Sphere;
@@ -66,21 +68,57 @@ pub trait SpatialIndex: Send + Sync + SpatialIndexClone {
         doc_id_inverse: &[Vec<Option<DocId>>],
     ) -> io::Result<MergeResult>;
 
-    /// Prepare an intersects query from a query polygon in lon/lat.
+    /// Prepare an intersects query from a geometry in lon/lat.
     fn prepare_intersects(&self, geometry: &Geometry<Plane>) -> Box<dyn PreparedSpatialQuery>;
 
-    /// Prepare a contains query from a query polygon in lon/lat.
+    /// Prepare a contains query from a geometry in lon/lat.
     fn prepare_contains(&self, geometry: &Geometry<Plane>) -> Box<dyn PreparedSpatialQuery>;
 
-    /// Prepare a within query from a query polygon in lon/lat.
+    /// Prepare boundary-inclusive coverage. Unsupported surfaces return an error.
+    fn prepare_covers(
+        &self,
+        _geometry: &Geometry<Plane>,
+    ) -> crate::Result<Box<dyn PreparedSpatialQuery>> {
+        Err(crate::TantivyError::InvalidArgument(
+            "Covers is not supported on this surface".into(),
+        ))
+    }
+
+    /// Identify the value and document owning a stored member.
+    fn value_id(&self, _edges: &[u8], _position: u32) -> crate::Result<(u32, u32)> {
+        Err(crate::TantivyError::InvalidArgument(
+            "Stored-value joins are not supported by this spatial index".into(),
+        ))
+    }
+
+    /// Prepare a probe for a stored outer value without projecting it a second time.
+    fn prepare_join_query(
+        &self,
+        _edges: &[u8],
+        _head: u32,
+        _relation: &SpatialRelation,
+    ) -> crate::Result<Box<dyn PreparedSpatialQuery>> {
+        Err(crate::TantivyError::InvalidArgument(
+            "Stored-value joins are not supported by this spatial index".into(),
+        ))
+    }
+
+    /// Check a join's surface contract before enumerating values.
+    fn validate_join(&self, _relation: &SpatialRelation) -> crate::Result<()> {
+        Err(crate::TantivyError::InvalidArgument(
+            "Stored-value joins are not supported by this spatial index".into(),
+        ))
+    }
+
+    /// Prepare a covered-by query from a geometry in lon/lat.
     fn prepare_within(&self, geometry: &Geometry<Plane>) -> Box<dyn PreparedSpatialQuery>;
 
-    /// Prepare a distance query from a query polygon in lon/lat. Distance in radians.
+    /// Prepare a distance query from a geometry in lon/lat. Distance in radians.
     fn prepare_distance(
         &self,
         geometry: &Geometry<Plane>,
         max_distance: f64,
-    ) -> Box<dyn PreparedSpatialQuery>;
+    ) -> crate::Result<Box<dyn PreparedSpatialQuery>>;
 }
 
 /// A prepared spatial query that searches one segment at a time.
@@ -93,6 +131,25 @@ pub trait PreparedSpatialQuery: Send + Sync {
         doc_ids_bytes: &[u8],
         max_doc: u32,
     ) -> io::Result<BitSet>;
+
+    /// Search only eligible documents. Built-in surfaces apply this before geometry work.
+    fn search_segment_filtered(
+        &self,
+        cells_bytes: &[u8],
+        edges_bytes: &[u8],
+        doc_ids_bytes: &[u8],
+        max_doc: u32,
+        filter: &BitSet,
+    ) -> io::Result<BitSet> {
+        let mut hits =
+            self.search_segment_bytes(cells_bytes, edges_bytes, doc_ids_bytes, max_doc)?;
+        for doc in 0..max_doc {
+            if !filter.contains(doc) {
+                hits.remove(doc);
+            }
+        }
+        Ok(hits)
+    }
 }
 
 /// Result of a spatial merge.
@@ -281,123 +338,187 @@ impl<S: Surface + Send + Sync + Clone + 'static> SpatialIndex for SurfaceIndex<S
     }
 
     fn prepare_intersects(&self, geometry: &Geometry<Plane>) -> Box<dyn PreparedSpatialQuery> {
-        let projected = geometry.project::<S>();
-        let set = to_geometry_set(&projected, 0);
-        Box::new(PreparedIntersects::<S> {
-            query: Intersects::new(set, CovererOptions::default()),
-        })
+        let set = to_geometry_set(&geometry.project::<S>(), 0);
+        Box::new(PreparedQuery::Intersects(Intersects::new(
+            set,
+            CovererOptions::default(),
+        )))
     }
 
     fn prepare_contains(&self, geometry: &Geometry<Plane>) -> Box<dyn PreparedSpatialQuery> {
-        let projected = geometry.project::<S>();
-        let set = to_geometry_set(&projected, 0);
-        Box::new(PreparedContainsNew::<S> {
-            query: Contains::new(set, CovererOptions::default()),
-        })
+        let set = to_geometry_set(&geometry.project::<S>(), 0);
+        Box::new(PreparedQuery::Contains(Contains::new(
+            set,
+            CovererOptions::default(),
+        )))
+    }
+
+    fn prepare_covers(
+        &self,
+        geometry: &Geometry<Plane>,
+    ) -> crate::Result<Box<dyn PreparedSpatialQuery>> {
+        if S::DIMENSIONS != 2 {
+            return Err(crate::TantivyError::InvalidArgument(
+                "Covers is not supported on this surface".into(),
+            ));
+        }
+        let set = to_geometry_set(&geometry.project::<S>(), 0);
+        let query = PlaneQuery::prepare(&set).unwrap();
+        Ok(Box::new(PreparedQuery::<S>::Plane(
+            query,
+            Predicate::Covers,
+            false,
+        )))
     }
 
     fn prepare_within(&self, geometry: &Geometry<Plane>) -> Box<dyn PreparedSpatialQuery> {
-        let projected = geometry.project::<S>();
-        let set = to_geometry_set(&projected, 0);
-        Box::new(PreparedWithin::<S> {
-            query: Within::new(set, CovererOptions::default()),
-        })
+        let set = to_geometry_set(&geometry.project::<S>(), 0);
+        Box::new(PreparedQuery::Within(Within::new(
+            set,
+            CovererOptions::default(),
+        )))
     }
 
     fn prepare_distance(
         &self,
         geometry: &Geometry<Plane>,
         max_distance: f64,
-    ) -> Box<dyn PreparedSpatialQuery> {
-        let projected = geometry.project::<S>();
-        let set = to_geometry_set(&projected, 0);
-        Box::new(PreparedDistance::<S> {
-            query: Distance::new(set, max_distance, CovererOptions::default()),
+    ) -> crate::Result<Box<dyn PreparedSpatialQuery>> {
+        if S::DIMENSIONS == 2 && max_distance > 0.0 {
+            return Err(crate::TantivyError::InvalidArgument(
+                "positive planar distance is not supported".into(),
+            ));
+        }
+        let set = to_geometry_set(&geometry.project::<S>(), 0);
+        Ok(Box::new(PreparedQuery::Distance(Distance::new(
+            set,
+            max_distance,
+            CovererOptions::default(),
+        ))))
+    }
+
+    fn value_id(&self, edges: &[u8], position: u32) -> crate::Result<(u32, u32)> {
+        Ok(EdgeReader::<S>::open(edges).value_id(position))
+    }
+
+    fn prepare_join_query(
+        &self,
+        edges: &[u8],
+        head: u32,
+        relation: &SpatialRelation,
+    ) -> crate::Result<Box<dyn PreparedSpatialQuery>> {
+        self.validate_join(relation)?;
+        let (_, set) = EdgeReader::<S>::open(edges).read_geometry_set(head);
+        let options = CovererOptions::default();
+        let query = match relation {
+            SpatialRelation::Intersects if S::DIMENSIONS == 2 => PreparedQuery::Plane(
+                PlaneQuery::prepare(&set).unwrap(),
+                Predicate::Intersects,
+                true,
+            ),
+            SpatialRelation::Intersects => PreparedQuery::Intersects(Intersects::new(set, options)),
+            SpatialRelation::Near(radius) => {
+                if S::DIMENSIONS == 2 && *radius > 0.0 {
+                    return Err(crate::TantivyError::InvalidArgument(
+                        "positive planar distance is not implemented".into(),
+                    ));
+                }
+                PreparedQuery::Distance(Distance::any_within(set, *radius, options))
+            }
+            SpatialRelation::Contains | SpatialRelation::Covers | SpatialRelation::CoveredBy => {
+                let query = PlaneQuery::prepare(&set).ok_or_else(|| {
+                    crate::TantivyError::InvalidArgument(
+                        "Coverage joins are not supported on this surface".into(),
+                    )
+                })?;
+                // The probe evaluates (inner, outer), so reverse the outer-first relation.
+                let predicate = match relation {
+                    SpatialRelation::Contains => Predicate::Within,
+                    SpatialRelation::Covers => Predicate::CoveredBy,
+                    SpatialRelation::CoveredBy => Predicate::Covers,
+                    _ => unreachable!(),
+                };
+                PreparedQuery::Plane(query, predicate, true)
+            }
+            SpatialRelation::Between(_, _) => {
+                return Err(crate::TantivyError::InvalidArgument(
+                    "Between joins are not supported".into(),
+                ))
+            }
+        };
+        Ok(Box::new(query))
+    }
+
+    fn validate_join(&self, relation: &SpatialRelation) -> crate::Result<()> {
+        let supported = match relation {
+            SpatialRelation::Intersects => true,
+            SpatialRelation::Near(radius) => S::DIMENSIONS == 3 || !(*radius > 0.0),
+            SpatialRelation::Contains | SpatialRelation::Covers | SpatialRelation::CoveredBy => {
+                S::DIMENSIONS == 2
+            }
+            SpatialRelation::Between(_, _) => false,
+        };
+        if supported {
+            Ok(())
+        } else {
+            Err(crate::TantivyError::InvalidArgument(
+                "Spatial join relation is not supported on this surface".into(),
+            ))
+        }
+    }
+}
+
+enum PreparedQuery<S: Surface> {
+    Intersects(Intersects<S>),
+    Contains(Contains<S>),
+    Within(Within<S>),
+    Distance(Distance<S>),
+    Plane(PlaneQuery, Predicate, bool),
+}
+
+impl<S: Surface> PreparedQuery<S> {
+    fn search(
+        &self,
+        cells: &[u8],
+        edges: &[u8],
+        doc_ids: &[u8],
+        max_doc: u32,
+        filter: Option<&BitSet>,
+    ) -> io::Result<BitSet> {
+        let reader = CellIndexReader::open_with_doc_ids(cells, doc_ids)?;
+        let mut cache = EdgeCache::new(vec![EdgeReader::<S>::open(edges)], 100_000);
+        Ok(match self {
+            Self::Intersects(query) => query.search(&reader, filter, &mut cache, max_doc),
+            Self::Contains(query) => query.search(&reader, filter, &mut cache, max_doc),
+            Self::Within(query) => query.search(&reader, filter, &mut cache, max_doc),
+            Self::Distance(query) => query.search(&reader, filter, &mut cache, max_doc),
+            Self::Plane(query, predicate, first_only) => {
+                query.search(&reader, filter, &cache, max_doc, *predicate, *first_only)
+            }
         })
     }
 }
 
-struct PreparedIntersects<S: Surface> {
-    query: Intersects<S>,
-}
-
-impl<S: Surface + 'static> PreparedSpatialQuery for PreparedIntersects<S> {
+impl<S: Surface + 'static> PreparedSpatialQuery for PreparedQuery<S> {
     fn search_segment_bytes(
         &self,
-        cells_bytes: &[u8],
-        edges_bytes: &[u8],
-        doc_ids_bytes: &[u8],
+        cells: &[u8],
+        edges: &[u8],
+        doc_ids: &[u8],
         max_doc: u32,
     ) -> io::Result<BitSet> {
-        let cell_reader = CellIndexReader::open_with_doc_ids(cells_bytes, doc_ids_bytes)?;
-        let edge_reader = EdgeReader::<S>::open(edges_bytes);
-        let mut edge_cache = EdgeCache::new(vec![edge_reader], 100_000);
-        Ok(self
-            .query
-            .search(&cell_reader, None, &mut edge_cache, max_doc))
+        self.search(cells, edges, doc_ids, max_doc, None)
     }
-}
 
-struct PreparedContainsNew<S: Surface> {
-    query: Contains<S>,
-}
-
-impl<S: Surface + 'static> PreparedSpatialQuery for PreparedContainsNew<S> {
-    fn search_segment_bytes(
+    fn search_segment_filtered(
         &self,
-        cells_bytes: &[u8],
-        edges_bytes: &[u8],
-        doc_ids_bytes: &[u8],
+        cells: &[u8],
+        edges: &[u8],
+        doc_ids: &[u8],
         max_doc: u32,
+        filter: &BitSet,
     ) -> io::Result<BitSet> {
-        let cell_reader = CellIndexReader::open_with_doc_ids(cells_bytes, doc_ids_bytes)?;
-        let edge_reader = EdgeReader::<S>::open(edges_bytes);
-        let mut edge_cache = EdgeCache::new(vec![edge_reader], 100_000);
-        Ok(self
-            .query
-            .search(&cell_reader, None, &mut edge_cache, max_doc))
-    }
-}
-
-struct PreparedWithin<S: Surface> {
-    query: Within<S>,
-}
-
-impl<S: Surface + 'static> PreparedSpatialQuery for PreparedWithin<S> {
-    fn search_segment_bytes(
-        &self,
-        cells_bytes: &[u8],
-        edges_bytes: &[u8],
-        doc_ids_bytes: &[u8],
-        max_doc: u32,
-    ) -> io::Result<BitSet> {
-        let cell_reader = CellIndexReader::open_with_doc_ids(cells_bytes, doc_ids_bytes)?;
-        let edge_reader = EdgeReader::<S>::open(edges_bytes);
-        let mut edge_cache = EdgeCache::new(vec![edge_reader], 100_000);
-        Ok(self
-            .query
-            .search(&cell_reader, None, &mut edge_cache, max_doc))
-    }
-}
-
-struct PreparedDistance<S: Surface> {
-    query: Distance<S>,
-}
-
-impl<S: Surface + 'static> PreparedSpatialQuery for PreparedDistance<S> {
-    fn search_segment_bytes(
-        &self,
-        cells_bytes: &[u8],
-        edges_bytes: &[u8],
-        doc_ids_bytes: &[u8],
-        max_doc: u32,
-    ) -> io::Result<BitSet> {
-        let cell_reader = CellIndexReader::open_with_doc_ids(cells_bytes, doc_ids_bytes)?;
-        let edge_reader = EdgeReader::<S>::open(edges_bytes);
-        let mut edge_cache = EdgeCache::new(vec![edge_reader], 100_000);
-        Ok(self
-            .query
-            .search(&cell_reader, None, &mut edge_cache, max_doc))
+        self.search(cells, edges, doc_ids, max_doc, Some(filter))
     }
 }
 

@@ -18,6 +18,8 @@ use super::edge_cache::EdgeCache;
 use super::edge_crosser::EdgeCrosser;
 use super::edge_provider::EdgeProvider;
 use super::geometry_set::GeometrySet;
+use super::plane::query::PlaneQuery;
+use super::plane::Predicate;
 use super::query_edge_provider::QueryEdgeProvider;
 use super::region_coverer::CovererOptions;
 use super::s1chord_angle::S1ChordAngle;
@@ -65,6 +67,7 @@ struct Matches {
 
 /// Prepared distance query, built once from query geometry and applied per segment.
 pub struct Distance<S: Surface> {
+    plane: Option<PlaneQuery>,
     query_index: ShapeIndex,
     query_edges: QueryEdgeProvider<S>,
     // Each edge has a member number and a vertex offset within that member. Ring gaps are skipped.
@@ -80,7 +83,18 @@ impl<S: Surface> Distance<S> {
     /// Nonpositive values and NaN select the intersection path. Positive values are capped at PI.
     /// Panics if a positive distance is requested on the plane.
     pub fn new(set: GeometrySet<S>, max_distance: f64, _options: CovererOptions) -> Self {
-        let query_index = Clipper::new(ClipOptions::default()).build(std::slice::from_ref(&set));
+        if S::DIMENSIONS == 2 {
+            assert!(
+                !(max_distance > 0.0),
+                "positive planar distance is not implemented"
+            );
+        }
+        let plane = PlaneQuery::prepare(&set);
+        let query_index = if plane.is_some() {
+            ShapeIndex::default()
+        } else {
+            Clipper::new(ClipOptions::default()).build(std::slice::from_ref(&set))
+        };
         let mut edges = Vec::new();
         let mut edge_ids = Vec::new();
         for (member_id, member) in set.members.iter().enumerate() {
@@ -130,6 +144,7 @@ impl<S: Surface> Distance<S> {
             })
         });
         Self {
+            plane,
             query_index,
             query_edges,
             edges,
@@ -176,6 +191,16 @@ impl<S: Surface> Distance<S> {
         edge_cache: &mut EdgeCache<'a, S>,
         max_doc: u32,
     ) -> BitSet {
+        if let Some(plane) = &self.plane {
+            return plane.search(
+                reader,
+                terms_filter,
+                edge_cache,
+                max_doc,
+                Predicate::Intersects,
+                self.first_only,
+            );
+        }
         let geometry_count = edge_cache.geometry_count(0);
         let mut matches = Matches {
             seen: BitSet::with_max_value(geometry_count),

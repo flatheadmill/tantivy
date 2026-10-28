@@ -1,4 +1,4 @@
-//! Contains query: find indexed geometries that contain the query polygon.
+//! Contains query: find indexed geometries that contain the query.
 
 use std::collections::VecDeque;
 
@@ -12,6 +12,8 @@ use super::edge_cache::EdgeCache;
 use super::edge_crosser::EdgeCrosser;
 use super::edge_provider::EdgeProvider;
 use super::geometry_set::GeometrySet;
+use super::plane::query::PlaneQuery;
+use super::plane::Predicate;
 use super::query_edge_provider::QueryEdgeProvider;
 use super::region_coverer::CovererOptions;
 use super::s2cell_id::S2CellId;
@@ -22,8 +24,9 @@ use crate::spatial::clipped_shape::ClippedShape;
 use crate::spatial::clipper::Clipper;
 use crate::spatial::shape_index::ShapeIndex;
 
-/// Prepared contains query, built once from a query polygon and applied per-segment.
+/// Prepared contains query, built once from a geometry and applied per segment.
 pub struct Contains<S: Surface> {
+    plane: Option<PlaneQuery>,
     query_index: ShapeIndex,
     query_edges: QueryEdgeProvider<S>,
 }
@@ -32,15 +35,21 @@ impl<S: Surface> Contains<S> {
     /// Build the query from a smashed GeometrySet.
     pub fn new(set: GeometrySet<S>, _options: CovererOptions) -> Self {
         let builder = Clipper::new(ClipOptions::default());
-        let query_index = builder.build(std::slice::from_ref(&set));
+        let plane = PlaneQuery::prepare(&set);
+        let query_index = if plane.is_some() {
+            ShapeIndex::default()
+        } else {
+            builder.build(std::slice::from_ref(&set))
+        };
         let query_edges = QueryEdgeProvider { set };
         Self {
+            plane,
             query_index,
             query_edges,
         }
     }
 
-    /// Search one segment for geometries that contain the query polygon.
+    /// Search one segment for geometries that contain the query.
     pub fn search<'a>(
         &self,
         reader: &'a CellIndexReader<'a>,
@@ -48,6 +57,16 @@ impl<S: Surface> Contains<S> {
         edge_cache: &mut EdgeCache<'a, S>,
         max_doc: u32,
     ) -> BitSet {
+        if let Some(plane) = &self.plane {
+            return plane.search(
+                reader,
+                terms_filter,
+                edge_cache,
+                max_doc,
+                Predicate::Contains,
+                false,
+            );
+        }
         let geometry_count = edge_cache.geometry_count(0);
         let mut seen = BitSet::with_max_value(geometry_count);
         let mut doc_ids = BitSet::with_max_value(max_doc);
@@ -165,8 +184,19 @@ impl<S: Surface> Contains<S> {
             let (i, j) = pcell.get_child_ij(i32::from(pos));
             let child = S2PaddedCell::from_parent(&pcell, i, j);
             edges = std::mem::take(&mut child_edges[i][j]);
-            contains_center ^=
-                crossing_parity::<S>(&pcell.get_center(), &child.get_center(), &edges, &get_edge);
+            if S::RING_ROLES {
+                contains_center = edge_cache
+                    .get(clipped.geometry_id)
+                    .edge_set()
+                    .contains_point(&child.get_center());
+            } else {
+                contains_center ^= crossing_parity::<S>(
+                    &pcell.get_center(),
+                    &child.get_center(),
+                    &edges,
+                    &get_edge,
+                );
+            }
             pcell = child;
         }
     }
@@ -232,7 +262,9 @@ impl<S: Surface> Contains<S> {
         while let Some(entry) = queue.pop_front() {
             let parent_center = entry.pcell.get_center();
             let mut children = covering_split(&entry, &get_edge, &start_for_cell);
-            covering_contains_center::<S>(&parent_center, &mut children, &get_edge);
+            covering_contains_center::<S>(&parent_center, &mut children, &get_edge, &|point| {
+                self.query_edges.get_edge_set((0, 0)).contains_point(point)
+            });
 
             for child in children {
                 if child.query_edges.is_empty() && child.contains_center {
@@ -317,7 +349,9 @@ impl<S: Surface> Contains<S> {
             if entry.pcell.level() < entry.first_index_level && !entry.pcell.id().is_leaf() {
                 let parent_center = entry.pcell.get_center();
                 let mut children = covering_split(&entry, &get_edge, &start_for_cell);
-                covering_contains_center::<S>(&parent_center, &mut children, &get_edge);
+                covering_contains_center::<S>(&parent_center, &mut children, &get_edge, &|point| {
+                    self.query_edges.get_edge_set((0, 0)).contains_point(point)
+                });
                 for child in children {
                     heap.push(child);
                 }

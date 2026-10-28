@@ -14,7 +14,6 @@ use crate::spatial::cell_index_reader::CellIndexReader;
 use crate::spatial::edge_reader::EdgeReader;
 use crate::spatial::executor::{PlanNode, SpatialExecutor, SpatialRelation};
 use crate::spatial::geometry::Geometry;
-use crate::spatial::geometry_set::to_geometry_set;
 use crate::spatial::plane::Plane;
 use crate::spatial::plane_support_tests::assert_partition;
 use crate::spatial::reader::SpatialReader;
@@ -93,7 +92,9 @@ fn check_prepared_queries<S: Surface + Clone + Send + Sync + 'static>() {
         implementation.prepare_intersects(&geometry),
         implementation.prepare_contains(&geometry),
         implementation.prepare_within(&geometry),
-        implementation.prepare_distance(&geometry, if S::DIMENSIONS == 2 { 0.0 } else { 0.01 }),
+        implementation
+            .prepare_distance(&geometry, if S::DIMENSIONS == 2 { 0.0 } else { 0.01 })
+            .unwrap(),
     ];
     for query in queries {
         for max_doc in [0, 1] {
@@ -388,7 +389,7 @@ fn test_zero_document_scorer_validates_present_cells() -> crate::Result<()> {
 #[test]
 fn test_executor_rejects_old_cells() -> crate::Result<()> {
     let (index, field) = index_with_payload(&[0; 12], 1)?;
-    let geometry = to_geometry_set(&Geometry::<Sphere>::Point(Sphere::project(0.0, 0.0)), 0);
+    let geometry = Geometry::<Plane>::Point([0.0, 0.0]);
     let all = || Box::new(PlanNode::Query(Box::new(AllQuery)));
     let searcher = index.reader()?.searcher();
     for node in [

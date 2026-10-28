@@ -70,7 +70,12 @@ fn check_rectangle<S: Surface>(polygon: R2Rect, reverse: bool) {
         let ids: Vec<_> = (0..4).map(|pos| parent.pcell.id().child(pos)).collect();
         let start = |id, _, _| (ids.iter().position(|&child| child == id).unwrap() as u32, 5);
         let mut children = covering_split(&parent, &get_edge, &start);
-        covering_contains_center(&parent.pcell.get_center(), &mut children, &get_edge);
+        covering_contains_center(
+            &parent.pcell.get_center(),
+            &mut children,
+            &get_edge,
+            &|point| S::contains_point(point, &ring, S::origin_inside(&ring)),
+        );
         for id in ids {
             let cell = S2PaddedCell::<S>::new(id, 0.0);
             let bound = cell.bound();

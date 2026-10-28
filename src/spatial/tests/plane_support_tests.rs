@@ -43,7 +43,13 @@ pub(crate) fn nominal_bound(id: S2CellId) -> R2Rect {
     let width = 1 << (30 - id.level());
     let lo = [i & -width, j & -width];
     let coordinate = |n: i32| n as f64 / (1u64 << 29) as f64 - 1.0;
-    R2Rect::from_points(lo.map(coordinate), lo.map(|n| coordinate(n + width)))
+    R2Rect::from_points(
+        [180.0 * coordinate(lo[0]), 90.0 * coordinate(lo[1])],
+        [
+            180.0 * coordinate(lo[0] + width),
+            90.0 * coordinate(lo[1] + width),
+        ],
+    )
 }
 
 pub(crate) fn interval_intersects(a: [f64; 2], b: [f64; 2], rect: &R2Rect) -> bool {
@@ -109,13 +115,14 @@ fn supported_edges(member: &EdgeSet<Plane>, bound: &R2Rect) -> Vec<u32> {
 }
 
 fn member_contains(member: &EdgeSet<Plane>, point: [f64; 2]) -> bool {
-    member.closed
-        && member
-            .ring_offsets
-            .windows(2)
-            .fold(false, |inside, offsets| {
-                inside ^ shifted_contains(point, &member.vertices[offsets[0]..offsets[1]])
-            })
+    if !member.closed {
+        return false;
+    }
+    let mut rings = member
+        .ring_offsets
+        .windows(2)
+        .map(|offsets| shifted_contains(point, &member.vertices[offsets[0]..offsets[1]]));
+    rings.next().unwrap_or(false) && !rings.any(|inside| inside)
 }
 
 pub(crate) fn assert_partition(cells: &[ShapeCell], members: &[(GeometryId, &EdgeSet<Plane>)]) {
@@ -214,6 +221,56 @@ fn test_plane_build_closed_support() {
 }
 
 #[test]
+fn test_plane_build_ring_roles() {
+    let rectangle = |x0, y0, x1, y1| vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]];
+    let shell = rectangle(-80.0, -40.0, 80.0, 40.0);
+    let mut twice = shell.clone();
+    twice.extend_from_slice(&shell[1..]);
+    for rings in [
+        vec![
+            shell.clone(),
+            rectangle(-40.0, -20.0, 20.0, 20.0),
+            rectangle(-20.0, -10.0, 40.0, 30.0),
+        ],
+        vec![shell.clone(), rectangle(100.0, -20.0, 140.0, 20.0)],
+        vec![shell.clone(), shell.clone()],
+        vec![twice],
+        vec![Vec::new(), shell],
+    ] {
+        for reverse in [false, true] {
+            let mut rings = rings.clone();
+            if reverse {
+                for ring in &mut rings {
+                    ring.reverse();
+                }
+            }
+            let set = to_geometry_set(&Geometry::<Plane>::Polygon(rings), 0);
+            for limit in [1, 100] {
+                let index = Clipper::<Plane>::new(
+                    ClipOptions::default()
+                        .with_max_edges_per_cell(limit)
+                        .with_min_short_edge_fraction(0.0),
+                )
+                .build(std::slice::from_ref(&set));
+                assert_partition(&index.cells, &[((0, 0), &set.members[0])]);
+                let provider = QueryEdgeProvider { set: set.clone() };
+                for point in [[0.0, 0.0], [-30.0, 0.0], [60.0, 0.0], [120.0, 0.0]] {
+                    assert_eq!(
+                        crate::spatial::shape_index_region::index_contains_point::<Plane, _>(
+                            &index,
+                            &provider,
+                            (0, 0),
+                            &point,
+                        ),
+                        member_contains(&set.members[0], point),
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn test_plane_shrink_closed_boundaries() {
     for (point, level) in [
         ([0.0, 0.25], 0),
@@ -222,6 +279,7 @@ fn test_plane_shrink_closed_boundaries() {
         ([0.3, 0.3], 30),
         ([-1.0, -1.0], 30),
     ] {
+        let point = Plane::face_uv_to_point(0, point[0], point[1]);
         let set = to_geometry_set(&Geometry::<Plane>::Point(point), 0);
         let index = Clipper::<Plane>::new(ClipOptions::default()).build(std::slice::from_ref(&set));
         assert_eq!(index.cells.len(), 1);
@@ -309,7 +367,12 @@ fn test_plane_query_partition_and_region() {
             }];
             while let Some(parent) = pending.pop() {
                 let mut children = covering_split(&parent, &get_edge, &|_, _, _| unreachable!());
-                covering_contains_center(&parent.pcell.get_center(), &mut children, &get_edge);
+                covering_contains_center(
+                    &parent.pcell.get_center(),
+                    &mut children,
+                    &get_edge,
+                    &|point| shifted_contains(*point, &ring),
+                );
                 for id in parent.pcell.id().children() {
                     let expected = supported_edges(&provider.set.members[0], &nominal_bound(id));
                     let inside = shifted_contains(Plane::cell_center(id), &ring);
