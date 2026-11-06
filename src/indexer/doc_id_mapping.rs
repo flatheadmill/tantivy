@@ -51,8 +51,16 @@ impl SegmentDocIdMapping {
     ///
     /// In the returned `DocAddress`, the `segment_ord` is the ordinal of targeted segment
     /// in the list of merged segments.
-    pub(crate) fn iter_old_doc_addrs(&self) -> impl Iterator<Item = DocAddress> + '_ {
+    pub fn iter_old_doc_addrs(&self) -> impl Iterator<Item = DocAddress> + '_ {
         self.new_doc_id_to_old_doc_addr.iter().copied()
+    }
+
+    /// Returns the source-segment alive bitsets used to build this mapping.
+    ///
+    /// Entries correspond to source segment ordinals. `None` means every document in that
+    /// segment is alive.
+    pub fn alive_bitsets(&self) -> &[Option<ReadOnlyBitSet>] {
+        &self.alive_bitsets
     }
 
     /// This flags means the segments are simply stacked in the order of their ordinal.
@@ -136,7 +144,7 @@ impl DocIdMapping {
     }
 
     /// Returns the new doc_ids in order of the old doc_ids
-    pub(crate) fn old_to_new_ids(&self) -> &[DocId] {
+    pub fn old_to_new_ids(&self) -> &[DocId] {
         &self.old_doc_id_to_new[..]
     }
 
