@@ -35,7 +35,7 @@ use crate::{DocId, Segment};
 /// depends on a custom plugin.
 ///
 /// [`Index::all_plugins`]: crate::Index::all_plugins
-pub trait SegmentPlugin: Send + Sync + 'static {
+pub trait SegmentPlugin: Send + Sync + Any {
     /// File extensions this component manages (e.g., `["idx", "pos", "term"]` for postings).
     fn extensions(&self) -> &[&str];
 
@@ -499,16 +499,13 @@ mod tests {
 
         // Two plugins claiming the same "marker" extension would make their writers
         // contend for the same segment file.
-        let index = Index::builder()
+        let err = Index::builder()
             .schema(schema)
             .register_plugin(Arc::new(MarkerPlugin))
             .register_plugin(Arc::new(MarkerPlugin))
-            .create_in_ram()?;
-
-        let err = index
-            .writer_with_num_threads::<crate::TantivyDocument>(1, 15_000_000)
+            .create_in_ram()
             .err()
-            .expect("writer creation should fail when two plugins claim one extension");
+            .expect("index creation should fail when two plugins claim one extension");
         assert!(
             matches!(err, TantivyError::ConflictingPlugins(ref exts) if exts.contains("marker")),
             "expected ConflictingPlugins error, got {err:?}"
@@ -571,19 +568,16 @@ mod tests {
         }
 
         // Native components own these files, so custom plugins cannot claim them.
-        for reserved in ["temp", "store.temp", "del", "cells", "edges", "docids"] {
+        for reserved in ["temp", "store.temp", "del"] {
             let mut schema_builder = Schema::builder();
             schema_builder.add_text_field("text", TEXT | STORED);
-            let index = Index::builder()
+            let err = Index::builder()
                 .schema(schema_builder.build())
                 .register_plugin(Arc::new(ReservedExtPlugin(reserved)))
-                .create_in_ram()?;
-
-            let err = index
-                .writer_with_num_threads::<crate::TantivyDocument>(1, 15_000_000)
+                .create_in_ram()
                 .err()
                 .unwrap_or_else(|| {
-                    panic!("writer creation should fail when a plugin claims `{reserved}`")
+                    panic!("index creation should fail when a plugin claims `{reserved}`")
                 });
             assert!(
                 matches!(err, TantivyError::ConflictingPlugins(ref exts) if exts.contains(reserved)),

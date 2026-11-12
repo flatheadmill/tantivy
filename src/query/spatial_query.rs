@@ -8,7 +8,7 @@ use common::BitSet;
 
 use crate::query::explanation::does_not_match;
 use crate::query::{BitSetDocSet, EmptyScorer, Explanation, Query, Scorer, Weight};
-use crate::schema::{Field, FieldType};
+use crate::schema::Field;
 use crate::spatial::geometry::Geometry;
 use crate::spatial::plane::Plane;
 use crate::spatial::spatial_index_manager::PreparedSpatialQuery;
@@ -117,19 +117,10 @@ impl Query for SpatialQuery {
                     .expect("searcher required for spatial query");
                 let schema = searcher.index().schema();
                 let field_entry = schema.get_field_entry(self.field);
-                let spatial_opts = match field_entry.field_type() {
-                    FieldType::Spatial(opts) => opts,
-                    _ => panic!("field is not spatial"),
-                };
-                let manager = searcher.index().spatial_indices();
-                let spatial_index = manager
-                    .get(spatial_opts.spatial_index_name())
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "spatial index '{}' not registered",
-                            spatial_opts.spatial_index_name()
-                        )
-                    });
+                let spatial_index = crate::spatial::plugin::spatial_index(
+                    field_entry,
+                    searcher.index().custom_plugins(),
+                )?;
                 match &self.predicate {
                     SpatialPredicate::Intersects => {
                         spatial_index.prepare_intersects(&plane_geometry)

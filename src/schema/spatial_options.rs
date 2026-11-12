@@ -3,9 +3,7 @@ use std::ops::BitOr;
 
 use serde::{Deserialize, Serialize};
 
-use crate::schema::flags::StoredFlag;
-
-const DEFAULT_SPATIAL_INDEX_NAME: &str = "sphere";
+use crate::schema::flags::{SchemaFlagList, StoredFlag};
 
 /// Name of a registered spatial index implementation.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -13,7 +11,7 @@ pub struct SpatialIndexName(Cow<'static, str>);
 
 impl Default for SpatialIndexName {
     fn default() -> Self {
-        SpatialIndexName::from_static(DEFAULT_SPATIAL_INDEX_NAME)
+        SpatialIndexName::from_static("")
     }
 }
 
@@ -35,6 +33,8 @@ impl SpatialIndexName {
 }
 
 /// Define how a spatial field should be handled by tantivy.
+///
+/// The default has no implementation name. Select one before creating an index.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 pub struct SpatialOptions {
     #[serde(default)]
@@ -81,12 +81,29 @@ impl<T: Into<SpatialOptions>> BitOr<T> for SpatialOptions {
         let other = other.into();
         SpatialOptions {
             stored: self.stored | other.stored,
-            spatial_index: if other.spatial_index.name() != DEFAULT_SPATIAL_INDEX_NAME {
+            spatial_index: if !other.spatial_index.name().is_empty() {
                 other.spatial_index
             } else {
                 self.spatial_index
             },
         }
+    }
+}
+
+impl From<()> for SpatialOptions {
+    fn from(_: ()) -> SpatialOptions {
+        SpatialOptions::default()
+    }
+}
+
+impl<Head, Tail> From<SchemaFlagList<Head, Tail>> for SpatialOptions
+where
+    Head: Clone,
+    Tail: Clone,
+    Self: BitOr<Output = Self> + From<Head> + From<Tail>,
+{
+    fn from(head_tail: SchemaFlagList<Head, Tail>) -> Self {
+        Self::from(head_tail.head) | Self::from(head_tail.tail)
     }
 }
 
@@ -96,5 +113,43 @@ impl From<StoredFlag> for SpatialOptions {
             stored: true,
             spatial_index: SpatialIndexName::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::STORED;
+
+    #[test]
+    fn test_explicit_name_composition() {
+        for (options, name, stored) in [
+            (SPHERE | PLANE, "plane", false),
+            (PLANE | SPHERE, "sphere", false),
+            (STORED | SPHERE, "sphere", true),
+            (SPHERE | STORED, "sphere", true),
+            (STORED | PLANE | SPHERE, "sphere", true),
+            (SpatialOptions::from(STORED), "", true),
+            (SpatialOptions::default() | PLANE, "plane", false),
+            (PLANE | SpatialOptions::default(), "plane", false),
+            (STORED | SPHERE.set_spatial_index("named"), "named", true),
+            (SPHERE.set_spatial_index("named") | STORED, "named", true),
+        ] {
+            assert_eq!(options.spatial_index_name(), name);
+            assert_eq!(options.is_stored(), stored);
+        }
+    }
+
+    #[test]
+    fn test_serialized_names_are_explicit() -> serde_json::Result<()> {
+        for name in ["sphere", "plane", "named"] {
+            let value = serde_json::json!({"stored": true, "spatial_index": name});
+            let options: SpatialOptions = serde_json::from_value(value.clone())?;
+            assert_eq!(options.spatial_index_name(), name);
+            assert_eq!(serde_json::to_value(options)?, value);
+        }
+        let options: SpatialOptions = serde_json::from_str(r#"{"stored":true}"#)?;
+        assert!(options.spatial_index_name().is_empty());
+        Ok(())
     }
 }

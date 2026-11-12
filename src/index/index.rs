@@ -31,7 +31,7 @@ use crate::plugin::SegmentPlugin;
 use crate::reader::{IndexReader, IndexReaderBuilder};
 use crate::schema::document::Document;
 use crate::schema::{Field, FieldType, Schema, Type};
-use crate::spatial::spatial_index_manager::SpatialIndexManager;
+use crate::spatial::plugin::validate_spatial_schema;
 use crate::store::StorePlugin;
 use crate::tokenizer::{TextAnalyzer, TokenizerManager};
 use crate::SegmentReader;
@@ -99,6 +99,25 @@ pub(crate) fn list_segment_files(
 /// on-disk extension so a custom plugin cannot claim the same file.
 const RESERVED_NON_PLUGIN_EXTENSIONS: &[&str] = &["temp", "store.temp", "del"];
 
+fn validate_plugin_extensions(plugins: &[Arc<dyn SegmentPlugin>]) -> crate::Result<()> {
+    let mut claimed: HashSet<&str> = RESERVED_NON_PLUGIN_EXTENSIONS.iter().copied().collect();
+    let mut conflicting = BTreeSet::new();
+    let builtins = builtin_plugins();
+    for plugin in builtins.iter().chain(plugins) {
+        for &extension in plugin.extensions() {
+            if !claimed.insert(extension) {
+                conflicting.insert(extension.to_string());
+            }
+        }
+    }
+    if !conflicting.is_empty() {
+        return Err(TantivyError::ConflictingPlugins(
+            conflicting.into_iter().collect::<Vec<_>>().join(", "),
+        ));
+    }
+    Ok(())
+}
+
 /// Save the index meta file.
 /// This operation is atomic :
 /// Either
@@ -164,7 +183,6 @@ pub struct IndexBuilder {
     index_settings: IndexSettings,
     tokenizer_manager: TokenizerManager,
     fast_field_tokenizer_manager: TokenizerManager,
-    spatial_index_manager: SpatialIndexManager,
     custom_plugins: Vec<Arc<dyn SegmentPlugin>>,
 }
 impl Default for IndexBuilder {
@@ -180,7 +198,6 @@ impl IndexBuilder {
             index_settings: IndexSettings::default(),
             tokenizer_manager: TokenizerManager::default(),
             fast_field_tokenizer_manager: TokenizerManager::default(),
-            spatial_index_manager: SpatialIndexManager::default(),
             custom_plugins: Vec::new(),
         }
     }
@@ -293,9 +310,10 @@ impl IndexBuilder {
         }
         let mut index = Index::open(dir)?;
         index.set_tokenizers(self.tokenizer_manager.clone());
-        index.set_spatial_indices(self.spatial_index_manager.clone());
         if index.schema() == self.get_expect_schema()? {
             index.custom_plugins.extend(self.custom_plugins);
+            validate_plugin_extensions(&index.custom_plugins)?;
+            index.validate_spatial_fields()?;
             Ok(index)
         } else {
             Err(TantivyError::SchemaError(
@@ -306,17 +324,8 @@ impl IndexBuilder {
 
     fn validate(&self) -> crate::Result<()> {
         if let Some(schema) = self.schema.as_ref() {
-            let has_spatial_plugin = self.custom_plugins.iter().any(|plugin| {
-                ["cells", "edges", "docids"]
-                    .iter()
-                    .all(|extension| plugin.extensions().contains(extension))
-            });
-            if schema.contains_spatial_field() && !has_spatial_plugin {
-                return Err(TantivyError::InvalidArgument(
-                    "a schema with spatial fields requires a registered spatial segment plugin"
-                        .to_string(),
-                ));
-            }
+            validate_plugin_extensions(&self.custom_plugins)?;
+            validate_spatial_schema(schema, &self.custom_plugins)?;
             if self.index_settings.manual_doc_id_mapping
                 && self.index_settings.sort_by_field.is_some()
             {
@@ -388,7 +397,6 @@ impl IndexBuilder {
         let mut index = Index::open_from_metas(directory, &metas, SegmentMetaInventory::default());
         index.set_tokenizers(self.tokenizer_manager);
         index.set_fast_field_tokenizers(self.fast_field_tokenizer_manager);
-        index.set_spatial_indices(self.spatial_index_manager);
         index.custom_plugins.extend(self.custom_plugins);
         Ok(index)
     }
@@ -403,7 +411,6 @@ pub struct Index {
     executor: Executor,
     tokenizers: TokenizerManager,
     fast_field_tokenizers: TokenizerManager,
-    spatial_indices: SpatialIndexManager,
     inventory: SegmentMetaInventory,
     custom_plugins: Vec<Arc<dyn SegmentPlugin>>,
     #[cfg(feature = "jitexpr")]
@@ -525,7 +532,6 @@ impl Index {
             schema,
             tokenizers: TokenizerManager::default(),
             fast_field_tokenizers: TokenizerManager::default(),
-            spatial_indices: SpatialIndexManager::default(),
             executor: Executor::single_thread(),
             inventory,
             custom_plugins: Vec::new(),
@@ -549,8 +555,12 @@ impl Index {
     ///
     /// The index records, at creation, the custom extensions it requires, so these
     /// operations fail closed with [`TantivyError::MissingPlugin`] when an owning
-    /// plugin is not registered — rather than dropping its data from a merge or
-    /// deleting its files during garbage collection.
+    /// plugin is not registered. This prevents merges and garbage collection from
+    /// discarding its data.
+    ///
+    /// Register spatial plugins before taking readers, writers, or segments. These
+    /// capture the current plugin list. Ordinary reads need no plugin, but spatial
+    /// queries resolve their implementation through the reader's captured list.
     pub fn register_plugin(&mut self, plugin: Arc<dyn SegmentPlugin>) {
         self.custom_plugins.push(plugin);
     }
@@ -568,16 +578,6 @@ impl Index {
     /// Accessor for the fast field tokenizer manager.
     pub fn fast_field_tokenizer(&self) -> &TokenizerManager {
         &self.fast_field_tokenizers
-    }
-
-    /// Setter for the spatial index manager.
-    pub fn set_spatial_indices(&mut self, spatial_indices: SpatialIndexManager) {
-        self.spatial_indices = spatial_indices;
-    }
-
-    /// Accessor for the spatial index manager.
-    pub fn spatial_indices(&self) -> &SpatialIndexManager {
-        &self.spatial_indices
     }
 
     /// Get the tokenizer associated with a specific field.
@@ -810,30 +810,17 @@ impl Index {
             .chain(self.custom_plugins.iter().cloned())
     }
 
+    pub(crate) fn validate_spatial_fields(&self) -> crate::Result<()> {
+        validate_spatial_schema(&self.schema, &self.custom_plugins)
+    }
+
     /// Validates that the registered plugin set matches the index's recorded plugin set:
     /// no two plugins claim the same extension, none claim a reserved one, and the
     /// registered custom plugins exactly match the extensions the index was created with.
     /// The plugin set is part of the index's structure, like the schema, and is fixed at
     /// creation.
     pub(crate) fn validate_plugins(&self) -> crate::Result<()> {
-        // No two plugins may claim the same extension, and none may claim a reserved one.
-        let all_plugins: Vec<_> = self.all_plugins().collect();
-        let mut claimed_extensions: HashSet<&str> =
-            RESERVED_NON_PLUGIN_EXTENSIONS.iter().copied().collect();
-        let mut conflicting: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        for plugin in &all_plugins {
-            for &ext in plugin.extensions() {
-                if !claimed_extensions.insert(ext) {
-                    conflicting.insert(ext.to_string());
-                }
-            }
-        }
-        if !conflicting.is_empty() {
-            return Err(crate::TantivyError::ConflictingPlugins(
-                conflicting.into_iter().collect::<Vec<_>>().join(", "),
-            ));
-        }
-
+        validate_plugin_extensions(&self.custom_plugins)?;
         // The index persists, at creation, the custom plugin extensions it requires; that
         // index-wide record is the single source of truth for the plugin set. The currently
         // registered custom plugins must match it exactly.
@@ -864,7 +851,7 @@ impl Index {
             return Err(crate::TantivyError::UnexpectedPlugin(unexpected.join(", ")));
         }
 
-        Ok(())
+        self.validate_spatial_fields()
     }
 
     /// Accessor to the index settings

@@ -49,6 +49,7 @@ impl SegmentWriter {
     /// - segment: The segment being written
     /// - schema
     pub fn for_segment(memory_budget_in_bytes: usize, segment: Segment) -> crate::Result<Self> {
+        segment.index().validate_spatial_fields()?;
         let schema = segment.schema();
         let ctx = PluginWriterContext {
             segment: &segment,

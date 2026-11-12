@@ -437,18 +437,8 @@ mod tests {
 
     fn expected_builtin_files(segment_id: SegmentId, delete_opstamp: u64) -> HashSet<PathBuf> {
         let segment_uuid = segment_id.uuid_string();
-        let mut files = HashSet::with_capacity(10);
-        for extension in [
-            "idx",
-            "pos",
-            "term",
-            "store",
-            "fast",
-            "fieldnorm",
-            "cells",
-            "edges",
-            "docids",
-        ] {
+        let mut files = HashSet::with_capacity(7);
+        for extension in ["idx", "pos", "term", "store", "fast", "fieldnorm"] {
             files.insert(PathBuf::from(format!("{segment_uuid}.{extension}")));
         }
         files.insert(PathBuf::from(format!(
@@ -533,8 +523,12 @@ mod tests {
         let inventory = SegmentMetaInventory::default();
         let segment_ids = [SegmentId::generate_random(), SegmentId::generate_random()];
         let mut metadata = IndexMeta::with_schema(Schema::builder().build());
+        // Spatial files are listed only through their persisted custom extensions.
         metadata.persisted_custom_extensions =
-            vec!["custom".to_string(), "custom.data".to_string()];
+            ["custom", "custom.data", "cells", "edges", "docids"]
+                .into_iter()
+                .map(str::to_string)
+                .collect();
         let mut expected = HashSet::default();
         for segment_id in segment_ids {
             let segment_meta = inventory.new_segment_meta(segment_id, 10);

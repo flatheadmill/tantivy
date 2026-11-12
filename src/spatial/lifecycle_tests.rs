@@ -129,7 +129,10 @@ fn assert_sidecar(index: &Index, geometry: Field, populated: bool) -> crate::Res
         let field = reader.spatial_fields().get_field(geometry)?.unwrap();
         assert_eq!(!field.doc_ids_bytes().is_empty(), populated);
         if populated {
-            let implementation = index.spatial_indices().get("sphere").unwrap();
+            let implementation = crate::spatial::plugin::spatial_index(
+                index.schema().get_field_entry(geometry),
+                index.custom_plugins(),
+            )?;
             let query = Geometry::Polygon(vec![vec![
                 [-30.0, -30.0],
                 [30.0, -30.0],
@@ -172,7 +175,7 @@ fn test_spatial_document_mappings_and_merge() -> crate::Result<()> {
         let mut writer: SingleSegmentIndexWriter = Index::builder()
             .schema(schema)
             .settings(settings)
-            .register_plugin(Arc::new(S2Plugin::<SpatialIndexes, NativeSpatial>::new()))
+            .register_plugin(Arc::new(S2Plugin::new::<SpatialIndexes, NativeSpatial>()))
             .single_segment_index_writer(directory.clone(), 50_000_000)?;
         for value in [30, 10, 20] {
             writer.add_document(document(id, geometry, value))?;
@@ -222,7 +225,7 @@ fn test_spatial_document_mappings_and_merge() -> crate::Result<()> {
             reopened.writer_with_num_threads::<TantivyDocument>(1, 50_000_000),
             Err(crate::TantivyError::MissingPlugin(_))
         ));
-        reopened.register_plugin(Arc::new(S2Plugin::<SpatialIndexes, NativeSpatial>::new()));
+        reopened.register_plugin(Arc::new(S2Plugin::new::<SpatialIndexes, NativeSpatial>()));
         assert_queries(&reopened, id, geometry, &[10, 30, 40])?;
         for segment in reopened.searchable_segments()? {
             let component = SegmentComponent::SpatialDocIds;
@@ -248,11 +251,8 @@ fn named_index(
     let index = Index::builder()
         .schema(schema)
         .settings(sorted_settings())
-        .register_plugin(Arc::new(S2Plugin::<SpatialIndexes, NativeSpatial>::new()))
+        .register_plugin(Arc::new(S2Plugin::new::<SpatialIndexes, NativeSpatial>()))
         .create_in_ram()?;
-    index
-        .spatial_indices()
-        .register("named", Box::new(SurfaceIndex::<Sphere>::new()));
     let mut writer = SingleSegmentIndexWriter::new(index, 50_000_000)?;
     for &value in values {
         let doc = if with_geometry {
@@ -266,12 +266,36 @@ fn named_index(
 }
 
 #[test]
-fn test_spatial_standalone_merge_keeps_source_slots_and_manager() -> crate::Result<()> {
+fn test_named_spatial_reopen_uses_registered_plugin() -> crate::Result<()> {
+    let (schema, id, geometry) = schema(SPHERE.set_spatial_index("named"));
+    let directory = RamDirectory::default();
+    let mut writer: SingleSegmentIndexWriter = Index::builder()
+        .schema(schema)
+        .settings(sorted_settings())
+        .register_plugin(Arc::new(S2Plugin::new::<SpatialIndexes, NativeSpatial>()))
+        .single_segment_index_writer(directory.clone(), 50_000_000)?;
+    for value in [10, 20] {
+        writer.add_document(document(id, geometry, value))?;
+    }
+    writer.finalize()?;
+    let mut reopened = Index::open(directory)?;
+    reopened.register_plugin(Arc::new(S2Plugin::new::<SpatialIndexes, NativeSpatial>()));
+    assert_queries(&reopened, id, geometry, &[10, 20])?;
+    let mut writer: IndexWriter = reopened.writer_with_num_threads(1, 50_000_000)?;
+    writer.set_merge_policy(Box::new(NoMergePolicy));
+    writer.add_document(document(id, geometry, 30))?;
+    writer.commit()?;
+    writer.merge(&reopened.searchable_segment_ids()?).wait()?;
+    assert_queries(&reopened, id, geometry, &[10, 20, 30])?;
+    writer.wait_merging_threads()?;
+    Ok(())
+}
+
+#[test]
+fn test_spatial_standalone_merge_keeps_source_slots_and_plugin() -> crate::Result<()> {
     let (schema, id, geometry) = schema(SPHERE.set_spatial_index("named"));
     let empty = named_index(schema.clone(), id, geometry, &[], false)?;
-    empty
-        .spatial_indices()
-        .register("first-source-only", Box::new(SurfaceIndex::<Sphere>::new()));
+    let first_plugin = empty.custom_plugins()[0].clone();
     let last = named_index(schema.clone(), id, geometry, &[30, 10], true)?;
     let absent = named_index(schema.clone(), id, geometry, &[15], false)?;
     let filtered = named_index(schema.clone(), id, geometry, &[90], true)?;
@@ -308,7 +332,7 @@ fn test_spatial_standalone_merge_keeps_source_slots_and_manager() -> crate::Resu
             sorted_settings()
         };
         let index = merge_filtered_segments(&segments, settings, filters, RamDirectory::default())?;
-        assert!(index.spatial_indices().get("first-source-only").is_some());
+        assert!(Arc::ptr_eq(&first_plugin, &index.custom_plugins()[0]));
         assert_queries(&index, id, geometry, &[20, 30])?;
         let searcher = index.reader()?.searcher();
         assert_eq!(searcher.num_docs(), 3);
@@ -360,7 +384,7 @@ fn test_spatial_files_are_optional_and_closed() -> crate::Result<()> {
                     if message.contains("requires a registered spatial segment plugin")
             ));
             builder =
-                builder.register_plugin(Arc::new(S2Plugin::<SpatialIndexes, NativeSpatial>::new()));
+                builder.register_plugin(Arc::new(S2Plugin::new::<SpatialIndexes, NativeSpatial>()));
         }
         let index = builder.create_in_ram()?;
         let mut writer: IndexWriter = index.writer_with_num_threads(1, 50_000_000)?;

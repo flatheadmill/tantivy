@@ -4,13 +4,14 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::io;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use common::CountingWriter;
 
 use crate::directory::WritePtr;
 use crate::plugin::{PluginMergeContext, PluginWriter, PluginWriterContext, SegmentPlugin};
 use crate::schema::document::{ErasedDocument, ErasedValue};
-use crate::schema::{Field, FieldEntry, Schema};
+use crate::schema::{Field, FieldEntry, FieldType, Schema};
 use crate::spatial::field_writer::SurfaceFieldWriter;
 use crate::spatial::geometry_set::GeometrySet;
 use crate::spatial::merge_field::MergeSource;
@@ -196,20 +197,105 @@ where
     }
 }
 
-/// Spatial segment component using `Input` and the implementations in `Catalog`.
-pub struct S2Plugin<Catalog, Input>(PhantomData<(Catalog, Input)>);
+/// Spatial segment component with a selected implementation catalog.
+pub struct S2Plugin {
+    catalog: Box<dyn BoundCatalog>,
+}
 
-impl<Catalog, Input> S2Plugin<Catalog, Input> {
-    /// Create a spatial segment plugin.
-    pub fn new() -> Self {
-        Self(PhantomData)
+impl S2Plugin {
+    /// Select the spatial implementations and document input.
+    pub fn new<Catalog, Input>() -> Self
+    where
+        Catalog: SpatialIndexCatalog<Input>,
+        Input: SpatialInput,
+    {
+        Self {
+            catalog: Box::new(CatalogBinding::<Catalog, Input>(PhantomData)),
+        }
     }
 }
 
-impl<Catalog, Input> Default for S2Plugin<Catalog, Input> {
-    fn default() -> Self {
-        Self::new()
+trait BoundCatalog: Send + Sync {
+    fn index(&self, entry: &FieldEntry) -> crate::Result<Option<Box<dyn SpatialIndex>>>;
+    fn writer(&self, schema: &Schema) -> crate::Result<SpatialPluginWriter>;
+}
+
+struct CatalogBinding<Catalog, Input>(PhantomData<(Catalog, Input)>);
+
+impl<Catalog, Input> BoundCatalog for CatalogBinding<Catalog, Input>
+where
+    Catalog: SpatialIndexCatalog<Input>,
+    Input: SpatialInput,
+{
+    fn index(&self, entry: &FieldEntry) -> crate::Result<Option<Box<dyn SpatialIndex>>> {
+        field_index_name::<Input>(entry)?
+            .map(Catalog::resolve_index)
+            .transpose()
     }
+
+    fn writer(&self, schema: &Schema) -> crate::Result<SpatialPluginWriter> {
+        SpatialPluginWriter::new::<Catalog, Input>(schema)
+    }
+}
+
+fn field_index_name<Input: SpatialInput>(entry: &FieldEntry) -> crate::Result<Option<&str>> {
+    let name = Input::index_name(entry)?;
+    if matches!(entry.field_type(), FieldType::Spatial(_)) && name.is_none() {
+        return Err(TantivyError::InvalidArgument(format!(
+            "spatial field '{}' is not supported by the registered plugin input",
+            entry.name()
+        )));
+    }
+    if name == Some("") {
+        return Err(TantivyError::InvalidArgument(format!(
+            "spatial field '{}' requires an explicit spatial index name",
+            entry.name()
+        )));
+    }
+    Ok(name)
+}
+
+pub(crate) fn spatial_index(
+    entry: &FieldEntry,
+    plugins: &[Arc<dyn SegmentPlugin>],
+) -> crate::Result<Box<dyn SpatialIndex>> {
+    if !matches!(entry.field_type(), FieldType::Spatial(_)) {
+        return Err(TantivyError::InvalidArgument(format!(
+            "field '{}' is not spatial",
+            entry.name()
+        )));
+    }
+    let mut owners = plugins
+        .iter()
+        .filter_map(|plugin| (plugin.as_ref() as &dyn Any).downcast_ref::<S2Plugin>());
+    let owner = owners.next().ok_or_else(|| {
+        TantivyError::InvalidArgument(
+            "a schema with spatial fields requires a registered spatial segment plugin".into(),
+        )
+    })?;
+    if owners.next().is_some() {
+        return Err(TantivyError::InvalidArgument(
+            "more than one spatial segment plugin is registered".into(),
+        ));
+    }
+    owner.catalog.index(entry)?.ok_or_else(|| {
+        TantivyError::InvalidArgument(format!(
+            "spatial field '{}' is not supported by the registered plugin input",
+            entry.name()
+        ))
+    })
+}
+
+pub(crate) fn validate_spatial_schema(
+    schema: &Schema,
+    plugins: &[Arc<dyn SegmentPlugin>],
+) -> crate::Result<()> {
+    for (_, entry) in schema.fields() {
+        if matches!(entry.field_type(), FieldType::Spatial(_)) {
+            spatial_index(entry, plugins)?;
+        }
+    }
+    Ok(())
 }
 
 struct SpatialPluginWriter {
@@ -224,7 +310,7 @@ impl SpatialPluginWriter {
     {
         let mut writers = HashMap::new();
         for (field, entry) in schema.fields() {
-            let Some(index_name) = Input::index_name(entry)? else {
+            let Some(index_name) = field_index_name::<Input>(entry)? else {
                 continue;
             };
             writers.insert(field, Catalog::resolve_writer(index_name)?);
@@ -282,19 +368,13 @@ impl PluginWriter for SpatialPluginWriter {
     }
 }
 
-impl<Catalog, Input> SegmentPlugin for S2Plugin<Catalog, Input>
-where
-    Catalog: SpatialIndexCatalog<Input>,
-    Input: SpatialInput,
-{
+impl SegmentPlugin for S2Plugin {
     fn extensions(&self) -> &[&str] {
         &["cells", "edges", "docids"]
     }
 
     fn create_writer(&self, ctx: &PluginWriterContext) -> crate::Result<Box<dyn PluginWriter>> {
-        Ok(Box::new(SpatialPluginWriter::new::<Catalog, Input>(
-            &ctx.segment.schema(),
-        )?))
+        Ok(Box::new(self.catalog.writer(&ctx.segment.schema())?))
     }
 
     fn merge(&self, ctx: PluginMergeContext) -> crate::Result<()> {
@@ -315,10 +395,9 @@ where
         }
 
         for (field, entry) in ctx.schema.fields() {
-            let Some(index_name) = Input::index_name(entry)? else {
+            let Some(index) = self.catalog.index(entry)? else {
                 continue;
             };
-            let index = Catalog::resolve_index(index_name)?;
 
             let mut readers = Vec::new();
             for reader in ctx.readers {

@@ -1,15 +1,6 @@
-//! Registry for spatial index implementations.
-//!
-//! `SpatialIndexManager` follows the same pattern as `TokenizerManager`. Users register
-//! implementations by name at index creation time. The registered implementations are retrieved
-//! at the writer, merger, and query integration points.
-//!
-//! Implementations are monomorphic behind a `dyn SpatialIndex` trait. The vtable lookup occurs
-//! at field boundaries, not per-geometry.
+//! Native spatial query preparation and field merging.
 
-use std::collections::HashMap;
 use std::io;
-use std::sync::{Arc, RwLock};
 
 use common::{BitSet, CountingWriter, ReadOnlyBitSet};
 
@@ -25,14 +16,12 @@ use crate::spatial::merge_field::{merge_field, MergeSource};
 use crate::spatial::plane::query::PlaneQuery;
 use crate::spatial::plane::{Plane, Predicate};
 use crate::spatial::region_coverer::CovererOptions;
-use crate::spatial::sphere::Sphere;
 use crate::spatial::surface::Surface;
 use crate::spatial::within::Within;
 use crate::DocId;
 
-/// Factory for per-field spatial writers, mergers, and queries. Registered in
-/// `SpatialIndexManager` by name.
-pub trait SpatialIndex: Send + Sync + SpatialIndexClone {
+/// A spatial implementation selected by the registered plugin catalog.
+pub trait SpatialIndex: Send + Sync {
     /// Merge source segments into a new segment.
     fn merge_field<'a>(
         &self,
@@ -81,24 +70,6 @@ pub trait PreparedSpatialQuery: Send + Sync {
         doc_ids_bytes: &[u8],
         max_doc: u32,
     ) -> io::Result<BitSet>;
-}
-
-/// Clone support for trait objects.
-pub trait SpatialIndexClone {
-    /// Clone into a boxed trait object.
-    fn clone_box(&self) -> Box<dyn SpatialIndex>;
-}
-
-impl<T: SpatialIndex + Clone + 'static> SpatialIndexClone for T {
-    fn clone_box(&self) -> Box<dyn SpatialIndex> {
-        Box::new(self.clone())
-    }
-}
-
-impl Clone for Box<dyn SpatialIndex> {
-    fn clone(&self) -> Self {
-        self.clone_box()
-    }
 }
 
 /// Concrete spatial index for a given surface.
@@ -242,41 +213,5 @@ impl<S: Surface + 'static> PreparedSpatialQuery for PreparedQuery<S> {
         max_doc: u32,
     ) -> io::Result<BitSet> {
         self.search(cells, edges, doc_ids, max_doc, None)
-    }
-}
-
-/// Manages spatial index implementations keyed by name.
-#[derive(Clone)]
-pub struct SpatialIndexManager {
-    indices: Arc<RwLock<HashMap<String, Box<dyn SpatialIndex>>>>,
-}
-
-impl SpatialIndexManager {
-    /// Register a spatial index implementation under a name.
-    pub fn register(&self, name: &str, index: Box<dyn SpatialIndex>) {
-        self.indices
-            .write()
-            .expect("acquiring the lock should never fail")
-            .insert(name.to_string(), index);
-    }
-
-    /// Retrieve a spatial index implementation by name.
-    pub fn get(&self, name: &str) -> Option<Box<dyn SpatialIndex>> {
-        self.indices
-            .read()
-            .expect("acquiring the lock should never fail")
-            .get(name)
-            .map(|i| i.clone_box())
-    }
-}
-
-impl Default for SpatialIndexManager {
-    fn default() -> Self {
-        let manager = SpatialIndexManager {
-            indices: Arc::new(RwLock::new(HashMap::new())),
-        };
-        manager.register("sphere", Box::new(SurfaceIndex::<Sphere>::new()));
-        manager.register("plane", Box::new(SurfaceIndex::<Plane>::new()));
-        manager
     }
 }

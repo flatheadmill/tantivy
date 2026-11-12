@@ -33,3 +33,7 @@ mod partition;
 #[cfg(test)]
 #[path = "tests/query_tests.rs"]
 mod query_tests;
+
+#[cfg(test)]
+#[path = "tests/registration_tests.rs"]
+mod registration_tests;

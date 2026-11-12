@@ -537,7 +537,7 @@ fn index_with_payload(cells: &[u8], documents: u32) -> crate::Result<(Index, Fie
     let id = schema.add_u64_field("id", STORED);
     let index = Index::builder()
         .schema(schema.build())
-        .register_plugin(Arc::new(S2Plugin::<SpatialIndexes, NativeSpatial>::new()))
+        .register_plugin(Arc::new(S2Plugin::new::<SpatialIndexes, NativeSpatial>()))
         .create_in_ram()
         .unwrap();
     let mut writer: SingleSegmentIndexWriter<TantivyDocument> =

@@ -15,7 +15,7 @@ fn main() -> tantivy::Result<()> {
     type SpatialIndexes = Cons<SurfaceIndex<Sphere>, Nil>;
     let index = Index::builder()
         .schema(schema.clone())
-        .register_plugin(Arc::new(S2Plugin::<SpatialIndexes, NativeSpatial>::new()))
+        .register_plugin(Arc::new(S2Plugin::new::<SpatialIndexes, NativeSpatial>()))
         .create_in_ram()?;
     let mut index_writer: IndexWriter = index.writer(50_000_000)?;
     let doc = TantivyDocument::parse_json(

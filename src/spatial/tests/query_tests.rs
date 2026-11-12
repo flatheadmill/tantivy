@@ -20,11 +20,8 @@ fn test_plane_queries_follow_registered_surface() -> crate::Result<()> {
     let schema = builder.build();
     let index = Index::builder()
         .schema(schema.clone())
-        .register_plugin(Arc::new(S2Plugin::<SpatialIndexes, NativeSpatial>::new()))
+        .register_plugin(Arc::new(S2Plugin::new::<SpatialIndexes, NativeSpatial>()))
         .create_in_ram()?;
-    index
-        .spatial_indices()
-        .register("cartesian", Box::new(SurfaceIndex::<Plane>::new()));
     let mut writer: IndexWriter = index.writer_with_num_threads(1, 50_000_000)?;
     writer.set_merge_policy(Box::new(NoMergePolicy));
     for json in [
@@ -108,7 +105,7 @@ fn test_sphere_covers_is_unsupported_before_search() -> crate::Result<()> {
     let field = builder.add_spatial_field("geometry", SPHERE);
     let index = Index::builder()
         .schema(builder.build())
-        .register_plugin(Arc::new(S2Plugin::<SpatialIndexes, NativeSpatial>::new()))
+        .register_plugin(Arc::new(S2Plugin::new::<SpatialIndexes, NativeSpatial>()))
         .create_in_ram()?;
     let query = SpatialQuery::with_predicate(
         field,

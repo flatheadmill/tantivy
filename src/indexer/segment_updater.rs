@@ -216,8 +216,11 @@ pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
         ));
     }
 
-    // The source index's writer was already validated against its recorded plugin
-    // set (else `MissingPlugin`); the merger reuses those registered plugins.
+    // Validate every source before creating the target, including empty segments.
+    // The merger carries the first source's registered plugins.
+    for segment in segments {
+        segment.index().validate_plugins()?;
+    }
     let merger = IndexMerger::open_with_custom_alive_set(
         target_schema.clone(),
         target_settings.clone(),
@@ -234,7 +237,6 @@ pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
         builder = builder.register_plugin(plugin.clone());
     }
     let mut merged_index = builder.create(output_directory)?;
-    merged_index.set_spatial_indices(segments[0].index().spatial_indices().clone());
 
     let merged_segment = merged_index.new_segment();
     let merged_segment_id = merged_segment.id();

@@ -96,7 +96,7 @@ impl Fixture {
             schema.add_spatial_field("geometry", if S::DIMENSIONS == 2 { PLANE } else { SPHERE });
         let index = Index::builder()
             .schema(schema.build())
-            .register_plugin(Arc::new(S2Plugin::<SpatialIndexes, NativeSpatial>::new()))
+            .register_plugin(Arc::new(S2Plugin::new::<SpatialIndexes, NativeSpatial>()))
             .create_in_ram()
             .unwrap();
         let mut writer: IndexWriter = index.writer_with_num_threads(1, 50_000_000).unwrap();
